@@ -44,13 +44,86 @@ class ControlBot:
 
     async def show_main(self, update, text="Media Manager"):
         settings = await self.db.get_settings()
-        connected = "Connected ✅" if settings["session_encrypted"] else "Not connected ❌"
-        service = "Running ✅" if settings["service_enabled"] else "Stopped ⏹"
-        body = (
-            f"🎬 <b>Telegram Media Manager</b>\n\n"
-            f"Account: {connected}\nService: {service}\n\n"
-            "Manage the complete media system below."
+
+        phone = settings["phone_number"] or ""
+        if phone and len(phone) > 6:
+            masked_phone = phone[:3] + "*" * (len(phone) - 6) + phone[-3:]
+        else:
+            masked_phone = phone
+
+        account_status = (
+            f"✅ Connected ({masked_phone})"
+            if settings["session_encrypted"]
+            else "❌ Not connected"
         )
+        service_status = (
+            "✅ Running" if settings["service_enabled"] else "⏹ Stopped"
+        )
+        duplicate_status = (
+            "✅ Enabled" if settings["delete_duplicates"] else "❌ Disabled"
+        )
+
+        database_name = None
+        source_names = []
+        destination_names = []
+
+        if settings["session_encrypted"]:
+            try:
+                chats = await self.get_accessible_chats()
+                chat_names = {int(chat["id"]): chat["name"] for chat in chats}
+
+                database_id = settings["database_chat_id"]
+                if database_id:
+                    database_name = chat_names.get(
+                        int(database_id), str(database_id)
+                    )
+
+                source_names = [
+                    chat_names.get(int(chat_id), str(chat_id))
+                    for chat_id in settings["source_chat_ids"]
+                ]
+                destination_names = [
+                    chat_names.get(int(chat_id), str(chat_id))
+                    for chat_id in settings["destination_chat_ids"]
+                ]
+            except Exception:
+                log.exception("Could not resolve chat names for dashboard")
+
+        database_status = (
+            f"✅ {database_name}"
+            if database_name
+            else "❌ Not connected"
+        )
+        source_status = (
+            f"✅ {len(source_names)} connected"
+            if source_names
+            else "❌ Not connected"
+        )
+        destination_status = (
+            f"✅ {len(destination_names)} connected"
+            if destination_names
+            else "❌ Not connected"
+        )
+
+        interval = int(settings["publish_interval_minutes"])
+        scheduler_status = (
+            f"✅ Every {interval} minutes"
+            if settings["service_enabled"]
+            else f"⏸ Every {interval} minutes"
+        )
+
+        body = (
+            "🎬 <b>Telegram Media Manager</b>\n\n"
+            f"📱 <b>Account:</b> {account_status}\n"
+            f"🗄 <b>Database:</b> {database_status}\n"
+            f"📥 <b>Sources:</b> {source_status}\n"
+            f"📤 <b>Destinations:</b> {destination_status}\n"
+            f"🧹 <b>Duplicate Delete:</b> {duplicate_status}\n"
+            f"⏰ <b>Scheduler:</b> {scheduler_status}\n"
+            f"▶️ <b>Service:</b> {service_status}\n\n"
+            "Select an option below."
+        )
+
         if update.callback_query:
             await update.callback_query.edit_message_text(
                 body, parse_mode="HTML", reply_markup=MAIN
@@ -367,27 +440,50 @@ class ControlBot:
                 reply_markup=keyboard([[("⬅️ Back", "back")]]),
             )
 
+        settings = await self.db.get_settings()
         context.user_data["selector_mode"] = mode
+
+        if mode == "source":
+            selected_ids = {
+                int(chat_id) for chat_id in settings["source_chat_ids"]
+            }
+            title = "📥 <b>Source Groups/Channels</b>"
+            summary = f"Connected: {len(selected_ids)}"
+        elif mode == "database":
+            selected_ids = (
+                {int(settings["database_chat_id"])}
+                if settings["database_chat_id"]
+                else set()
+            )
+            title = "🗄 <b>Database Group/Channel</b>"
+            summary = (
+                "Connected: 1" if selected_ids else "Connected: 0"
+            )
+        else:
+            selected_ids = {
+                int(chat_id) for chat_id in settings["destination_chat_ids"]
+            }
+            title = "📤 <b>Destination Groups/Channels</b>"
+            summary = f"Connected: {len(selected_ids)}"
+
         rows = []
         for chat in chats[:40]:
-            label = chat["name"]
+            chat_id = int(chat["id"])
+            prefix = "✅ " if chat_id in selected_ids else ""
+            label = prefix + chat["name"]
+
             if len(label) > 34:
                 label = label[:31] + "..."
             if chat["protected"]:
                 label += " 🔒"
-            rows.append([(label, f"pickchat:{mode}:{chat['id']}")])
 
-        if mode == "source":
-            title = "📥 Select Source Group/Channel"
-        elif mode == "database":
-            title = "🗄 Select Database Group/Channel"
-        else:
-            title = "📤 Select Destination Group/Channel"
+            rows.append([(label, f"pickchat:{mode}:{chat_id}")])
 
         rows.append([("✅ Done", "selector_done"), ("⬅️ Back", "back")])
 
         await update.callback_query.edit_message_text(
-            title + "\n\nTap a chat to select it.",
+            f"{title}\n\n{summary}\n\nTap a chat to select or remove it.",
+            parse_mode="HTML",
             reply_markup=keyboard(rows),
         )
 
