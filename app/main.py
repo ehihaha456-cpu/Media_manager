@@ -53,29 +53,47 @@ async def main() -> None:
         format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     )
 
-    db = Database(config.sqlite_path)
-    await db.initialize()
+    database = Database(
+        config.mongodb_uri,
+        config.mongodb_database,
+    )
+    await database.initialize()
+    logging.getLogger(__name__).info(
+        "MongoDB connected successfully"
+    )
 
     fernet = load_fernet(config.master_key)
-    runtime = MediaRuntime(db, fernet, config.temp_dir)
+    runtime = MediaRuntime(
+        database,
+        fernet,
+        config.temp_dir,
+    )
     health_server = await start_health_server()
 
-    settings = await db.get_settings()
+    settings = await database.get_settings()
     if settings["service_enabled"]:
         try:
             await runtime.start()
         except Exception:
             logging.exception("Could not restore media runtime")
-            await db.update_settings(service_enabled=0)
+            await database.update_settings(service_enabled=0)
 
-    control = ControlBot(config, db, fernet, runtime)
+    control = ControlBot(
+        config,
+        database,
+        fernet,
+        runtime,
+    )
     app = control.build()
 
     try:
         async with app:
             await app.start()
             await app.updater.start_polling(
-                allowed_updates=["message", "callback_query"]
+                allowed_updates=[
+                    "message",
+                    "callback_query",
+                ]
             )
             await asyncio.Event().wait()
     finally:
@@ -87,6 +105,8 @@ async def main() -> None:
             await app.updater.stop()
         if app.running:
             await app.stop()
+
+        await database.close()
 
 
 if __name__ == "__main__":

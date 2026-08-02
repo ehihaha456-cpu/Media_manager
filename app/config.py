@@ -23,7 +23,8 @@ class AppConfig:
     api_id: int
     api_hash: str
     master_key: str | None
-    sqlite_path: Path
+    mongodb_uri: str
+    mongodb_database: str
     temp_dir: Path
     log_level: str
 
@@ -35,10 +36,13 @@ def load_app_config() -> AppConfig:
         api_id=int(required("API_ID")),
         api_hash=required("API_HASH"),
         master_key=os.getenv("MASTER_KEY", "").strip() or None,
-        sqlite_path=Path(os.getenv("SQLITE_PATH", "data/media_manager.sqlite3")),
+        mongodb_uri=required("MONGODB_URI"),
+        mongodb_database=os.getenv(
+            "MONGODB_DATABASE",
+            "telegram_media_manager",
+        ).strip(),
         temp_dir=Path(os.getenv("TEMP_DIR", "data/tmp")),
         log_level=os.getenv("LOG_LEVEL", "INFO").upper().strip(),
     )
-    config.sqlite_path.parent.mkdir(parents=True, exist_ok=True)
     config.temp_dir.mkdir(parents=True, exist_ok=True)
     return config

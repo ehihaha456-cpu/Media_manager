@@ -1,176 +1,289 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from pathlib import Path
-import json
-import aiosqlite
+from typing import Any
+
+from pymongo import ASCENDING, AsyncMongoClient, ReturnDocument
 
 
-SCHEMA = """
-PRAGMA journal_mode=WAL;
-
-CREATE TABLE IF NOT EXISTS settings (
-    id INTEGER PRIMARY KEY CHECK (id = 1),
-    api_id INTEGER,
-    api_hash_encrypted TEXT,
-    phone_number TEXT,
-    session_encrypted TEXT,
-    source_chat_ids TEXT NOT NULL DEFAULT '[]',
-    database_chat_id INTEGER,
-    destination_chat_ids TEXT NOT NULL DEFAULT '[]',
-    delete_duplicates INTEGER NOT NULL DEFAULT 0,
-    copy_to_database INTEGER NOT NULL DEFAULT 1,
-    queue_for_publishing INTEGER NOT NULL DEFAULT 1,
-    publish_interval_minutes INTEGER NOT NULL DEFAULT 60,
-    publish_batch_size INTEGER NOT NULL DEFAULT 1,
-    service_enabled INTEGER NOT NULL DEFAULT 0,
-    updated_at TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS media (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    sha256 TEXT NOT NULL UNIQUE,
-    media_kind TEXT NOT NULL,
-    size_bytes INTEGER NOT NULL,
-    source_chat_id INTEGER NOT NULL,
-    source_message_id INTEGER NOT NULL,
-    database_chat_id INTEGER,
-    database_message_id INTEGER,
-    caption TEXT,
-    created_at TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS publish_queue (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    media_id INTEGER NOT NULL,
-    destination_chat_id INTEGER NOT NULL,
-    status TEXT NOT NULL DEFAULT 'pending',
-    attempts INTEGER NOT NULL DEFAULT 0,
-    last_error TEXT,
-    created_at TEXT NOT NULL,
-    published_at TEXT,
-    UNIQUE(media_id, destination_chat_id)
-);
-"""
+def now() -> datetime:
+    return datetime.now(timezone.utc)
 
 
-def now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+DEFAULT_SETTINGS: dict[str, Any] = {
+    "_id": "owner",
+    "api_id": None,
+    "api_hash_encrypted": None,
+    "phone_number": None,
+    "session_encrypted": None,
+    "source_chat_ids": [],
+    "database_chat_id": None,
+    "destination_chat_ids": [],
+    "delete_duplicates": 0,
+    "copy_to_database": 1,
+    "queue_for_publishing": 1,
+    "publish_interval_minutes": 60,
+    "publish_batch_size": 1,
+    "service_enabled": 0,
+    "updated_at": None,
+}
 
 
 class Database:
-    def __init__(self, path: Path):
-        self.path = path
+    def __init__(self, mongodb_uri: str, database_name: str):
+        self.client = AsyncMongoClient(
+            mongodb_uri,
+            serverSelectionTimeoutMS=15000,
+            connectTimeoutMS=15000,
+            retryWrites=True,
+        )
+        self.database = self.client[database_name]
+        self.settings = self.database["settings"]
+        self.media = self.database["media"]
+        self.publish_queue = self.database["publish_queue"]
+        self.counters = self.database["counters"]
 
-    async def initialize(self):
-        async with aiosqlite.connect(self.path) as db:
-            await db.executescript(SCHEMA)
-            await db.execute(
-                "INSERT OR IGNORE INTO settings (id, updated_at) VALUES (1, ?)",
-                (now(),),
-            )
-            await db.commit()
+    async def initialize(self) -> None:
+        await self.client.admin.command("ping")
+
+        await self.settings.update_one(
+            {"_id": "owner"},
+            {
+                "$setOnInsert": {
+                    **DEFAULT_SETTINGS,
+                    "updated_at": now(),
+                }
+            },
+            upsert=True,
+        )
+
+        await self.media.create_index(
+            [("sha256", ASCENDING)],
+            unique=True,
+            name="unique_media_sha256",
+        )
+        await self.publish_queue.create_index(
+            [
+                ("media_id", ASCENDING),
+                ("destination_chat_id", ASCENDING),
+            ],
+            unique=True,
+            name="unique_media_destination",
+        )
+        await self.publish_queue.create_index(
+            [("status", ASCENDING), ("id", ASCENDING)],
+            name="pending_queue_order",
+        )
+
+    async def close(self) -> None:
+        await self.client.close()
+
+    async def _next_id(self, name: str) -> int:
+        document = await self.counters.find_one_and_update(
+            {"_id": name},
+            {"$inc": {"value": 1}},
+            upsert=True,
+            return_document=ReturnDocument.AFTER,
+        )
+        return int(document["value"])
 
     async def get_settings(self) -> dict:
-        async with aiosqlite.connect(self.path) as db:
-            db.row_factory = aiosqlite.Row
-            cur = await db.execute("SELECT * FROM settings WHERE id=1")
-            row = dict(await cur.fetchone())
-            row["source_chat_ids"] = json.loads(row["source_chat_ids"])
-            row["destination_chat_ids"] = json.loads(row["destination_chat_ids"])
-            return row
+        document = await self.settings.find_one({"_id": "owner"})
+        if document is None:
+            await self.initialize()
+            document = await self.settings.find_one({"_id": "owner"})
 
-    async def update_settings(self, **values):
+        result = dict(DEFAULT_SETTINGS)
+        result.update(document or {})
+        result["source_chat_ids"] = [
+            int(value)
+            for value in result.get("source_chat_ids", [])
+        ]
+        result["destination_chat_ids"] = [
+            int(value)
+            for value in result.get("destination_chat_ids", [])
+        ]
+        return result
+
+    async def update_settings(self, **values) -> None:
         if not values:
             return
-        for key in ("source_chat_ids", "destination_chat_ids"):
-            if key in values:
-                values[key] = json.dumps(values[key])
+
         values["updated_at"] = now()
-        columns = ", ".join(f"{key}=?" for key in values)
-        async with aiosqlite.connect(self.path) as db:
-            await db.execute(
-                f"UPDATE settings SET {columns} WHERE id=1",
-                tuple(values.values()),
+        await self.settings.update_one(
+            {"_id": "owner"},
+            {"$set": values},
+            upsert=True,
+        )
+
+    async def find_by_hash(self, sha256: str) -> dict | None:
+        document = await self.media.find_one({"sha256": sha256})
+        return dict(document) if document else None
+
+    async def add_media(
+        self,
+        sha256: str,
+        kind: str,
+        size: int,
+        chat_id: int,
+        message_id: int,
+        caption: str | None,
+    ) -> int:
+        media_id = await self._next_id("media")
+        await self.media.insert_one(
+            {
+                "_id": media_id,
+                "id": media_id,
+                "sha256": sha256,
+                "media_kind": kind,
+                "size_bytes": int(size),
+                "source_chat_id": int(chat_id),
+                "source_message_id": int(message_id),
+                "database_chat_id": None,
+                "database_message_id": None,
+                "caption": caption,
+                "created_at": now(),
+            }
+        )
+        return media_id
+
+    async def set_database_message(
+        self,
+        media_id: int,
+        chat_id: int,
+        message_id: int,
+    ) -> None:
+        await self.media.update_one(
+            {"_id": int(media_id)},
+            {
+                "$set": {
+                    "database_chat_id": int(chat_id),
+                    "database_message_id": int(message_id),
+                }
+            },
+        )
+
+    async def enqueue(
+        self,
+        media_id: int,
+        destination_chat_id: int,
+    ) -> None:
+        existing = await self.publish_queue.find_one(
+            {
+                "media_id": int(media_id),
+                "destination_chat_id": int(destination_chat_id),
+            },
+            {"_id": 1},
+        )
+        if existing:
+            return
+
+        queue_id = await self._next_id("publish_queue")
+        try:
+            await self.publish_queue.insert_one(
+                {
+                    "_id": queue_id,
+                    "id": queue_id,
+                    "media_id": int(media_id),
+                    "destination_chat_id": int(destination_chat_id),
+                    "status": "pending",
+                    "attempts": 0,
+                    "last_error": None,
+                    "created_at": now(),
+                    "published_at": None,
+                }
             )
-            await db.commit()
-
-    async def find_by_hash(self, sha256: str):
-        async with aiosqlite.connect(self.path) as db:
-            db.row_factory = aiosqlite.Row
-            cur = await db.execute("SELECT * FROM media WHERE sha256=?", (sha256,))
-            row = await cur.fetchone()
-            return dict(row) if row else None
-
-    async def add_media(self, sha256, kind, size, chat_id, message_id, caption):
-        async with aiosqlite.connect(self.path) as db:
-            cur = await db.execute(
-                """INSERT INTO media
-                (sha256, media_kind, size_bytes, source_chat_id,
-                 source_message_id, caption, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                (sha256, kind, size, chat_id, message_id, caption, now()),
+        except Exception:
+            # A simultaneous duplicate insert can safely be ignored.
+            existing = await self.publish_queue.find_one(
+                {
+                    "media_id": int(media_id),
+                    "destination_chat_id": int(destination_chat_id),
+                },
+                {"_id": 1},
             )
-            await db.commit()
-            return int(cur.lastrowid)
+            if not existing:
+                raise
 
-    async def set_database_message(self, media_id, chat_id, message_id):
-        async with aiosqlite.connect(self.path) as db:
-            await db.execute(
-                """UPDATE media SET database_chat_id=?, database_message_id=?
-                WHERE id=?""",
-                (chat_id, message_id, media_id),
+    async def pending(self, limit: int) -> list[dict]:
+        cursor = (
+            self.publish_queue.find({"status": "pending"})
+            .sort("id", ASCENDING)
+            .limit(int(limit))
+        )
+
+        rows: list[dict] = []
+        async for queue in cursor:
+            media = await self.media.find_one(
+                {"_id": int(queue["media_id"])}
             )
-            await db.commit()
+            if not media:
+                await self.publish_queue.update_one(
+                    {"_id": queue["_id"]},
+                    {
+                        "$set": {
+                            "status": "failed",
+                            "last_error": "Media record not found",
+                        }
+                    },
+                )
+                continue
 
-    async def enqueue(self, media_id, destination_chat_id):
-        async with aiosqlite.connect(self.path) as db:
-            await db.execute(
-                """INSERT OR IGNORE INTO publish_queue
-                (media_id, destination_chat_id, created_at)
-                VALUES (?, ?, ?)""",
-                (media_id, destination_chat_id, now()),
+            rows.append(
+                {
+                    "queue_id": int(queue["id"]),
+                    "destination_chat_id": int(
+                        queue["destination_chat_id"]
+                    ),
+                    "source_chat_id": int(
+                        media["source_chat_id"]
+                    ),
+                    "source_message_id": int(
+                        media["source_message_id"]
+                    ),
+                    "database_chat_id": media.get(
+                        "database_chat_id"
+                    ),
+                    "database_message_id": media.get(
+                        "database_message_id"
+                    ),
+                    "caption": media.get("caption"),
+                }
             )
-            await db.commit()
+        return rows
 
-    async def pending(self, limit):
-        async with aiosqlite.connect(self.path) as db:
-            db.row_factory = aiosqlite.Row
-            cur = await db.execute(
-                """SELECT q.id queue_id, q.destination_chat_id,
-                m.source_chat_id, m.source_message_id,
-                m.database_chat_id, m.database_message_id, m.caption
-                FROM publish_queue q JOIN media m ON m.id=q.media_id
-                WHERE q.status='pending' ORDER BY q.id LIMIT ?""",
-                (limit,),
-            )
-            return [dict(x) for x in await cur.fetchall()]
+    async def mark_published(self, queue_id: int) -> None:
+        await self.publish_queue.update_one(
+            {"_id": int(queue_id)},
+            {
+                "$set": {
+                    "status": "published",
+                    "published_at": now(),
+                    "last_error": None,
+                }
+            },
+        )
 
-    async def mark_published(self, queue_id):
-        async with aiosqlite.connect(self.path) as db:
-            await db.execute(
-                """UPDATE publish_queue SET status='published',
-                published_at=?, last_error=NULL WHERE id=?""",
-                (now(), queue_id),
-            )
-            await db.commit()
+    async def mark_failed(
+        self,
+        queue_id: int,
+        error: Exception | str,
+    ) -> None:
+        await self.publish_queue.update_one(
+            {"_id": int(queue_id)},
+            {
+                "$inc": {"attempts": 1},
+                "$set": {"last_error": str(error)[:1000]},
+            },
+        )
 
-    async def mark_failed(self, queue_id, error):
-        async with aiosqlite.connect(self.path) as db:
-            await db.execute(
-                """UPDATE publish_queue SET attempts=attempts+1,
-                last_error=? WHERE id=?""",
-                (str(error)[:1000], queue_id),
-            )
-            await db.commit()
-
-    async def statistics(self):
-        async with aiosqlite.connect(self.path) as db:
-            media = (await (await db.execute("SELECT COUNT(*) FROM media")).fetchone())[0]
-            queued = (await (await db.execute(
-                "SELECT COUNT(*) FROM publish_queue WHERE status='pending'"
-            )).fetchone())[0]
-            published = (await (await db.execute(
-                "SELECT COUNT(*) FROM publish_queue WHERE status='published'"
-            )).fetchone())[0]
-            return {"media": media, "queued": queued, "published": published}
+    async def statistics(self) -> dict:
+        return {
+            "media": await self.media.count_documents({}),
+            "queued": await self.publish_queue.count_documents(
+                {"status": "pending"}
+            ),
+            "published": await self.publish_queue.count_documents(
+                {"status": "published"}
+            ),
+        }
