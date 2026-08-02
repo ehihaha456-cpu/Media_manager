@@ -27,6 +27,7 @@ MAIN = keyboard([
     [("📥 Source Chats", "source"), ("🗄 Database Chat", "database")],
     [("📤 Destination Chats", "destination")],
     [("🧹 Duplicate Settings", "duplicates"), ("⏰ Scheduler", "scheduler")],
+    [("⚡ Performance", "performance")],
     [("▶️ Start / Stop", "service"), ("📊 Statistics", "stats")],
 ])
 
@@ -105,6 +106,10 @@ class ControlBot:
             else "❌ Not connected"
         )
 
+        performance_mode = str(
+            settings.get("performance_mode", "balanced")
+        ).title()
+
         interval = int(settings["publish_interval_minutes"])
         scheduler_status = (
             f"✅ Every {interval} minutes"
@@ -120,6 +125,7 @@ class ControlBot:
             f"📤 <b>Destinations:</b> {destination_status}\n"
             f"🧹 <b>Duplicate Delete:</b> {duplicate_status}\n"
             f"⏰ <b>Scheduler:</b> {scheduler_status}\n"
+            f"⚡ <b>Performance:</b> {performance_mode}\n"
             f"▶️ <b>Service:</b> {service_status}\n\n"
             "Select an option below."
         )
@@ -243,9 +249,6 @@ class ControlBot:
         if action == "toggle_duplicates":
             new_value = 0 if settings["delete_duplicates"] else 1
             await self.db.update_settings(delete_duplicates=new_value)
-            updated = await self.db.get_settings()
-            if updated["service_enabled"]:
-                await self.runtime.restart()
             return await q.edit_message_text(
                 f"🧹 <b>Duplicate Settings</b>\\n\\nAuto delete: "
                 f"{'Enabled ✅' if new_value else 'Disabled ❌'}",
@@ -255,6 +258,43 @@ class ControlBot:
                     [("⬅️ Back", "back")],
                 ]),
             )
+
+
+        if action == "performance":
+            current = str(
+                settings.get("performance_mode", "balanced")
+            ).lower()
+            return await q.edit_message_text(
+                "⚡ <b>Performance Mode</b>\n\n"
+                f"Current: <b>{current.title()}</b>\n\n"
+                "Low: 1 worker / 1 parallel post\n"
+                "Balanced: 2 workers / 3 parallel posts\n"
+                "Turbo: 4 workers / 6 parallel posts",
+                parse_mode="HTML",
+                reply_markup=keyboard([
+                    [
+                        ("🟢 Low", "set_performance:low"),
+                        ("🟡 Balanced", "set_performance:balanced"),
+                    ],
+                    [("🔴 Turbo", "set_performance:turbo")],
+                    [("⬅️ Back", "back")],
+                ]),
+            )
+
+        if action.startswith("set_performance:"):
+            mode = action.split(":", 1)[1]
+            if mode not in {"low", "balanced", "turbo"}:
+                return
+            await self.db.update_settings(
+                performance_mode=mode
+            )
+            updated = await self.db.get_settings()
+            if updated["service_enabled"]:
+                await self.runtime.restart()
+            await q.answer(
+                f"{mode.title()} mode enabled ✅"
+            )
+            return await self.show_main(update)
 
         if action == "scheduler":
             context.user_data["state"] = "interval"
@@ -271,20 +311,20 @@ class ControlBot:
             else:
                 if not settings["session_encrypted"]:
                     return await q.answer("Connect Telegram account first.", show_alert=True)
-                if not settings["source_chat_ids"] and not settings["database_chat_id"]:
-                    return await q.edit_message_text(
-                        "Select at least one Source or Database chat first.",
-                        reply_markup=keyboard([[("⬅️ Back", "back")]]),
+                if not settings["source_chat_ids"]:
+                    return await q.answer(
+                        "Add at least one Source chat.",
+                        show_alert=True,
                     )
                 if not settings["database_chat_id"]:
-                    return await q.edit_message_text(
-                        "Select a Database chat first.",
-                        reply_markup=keyboard([[("⬅️ Back", "back")]]),
+                    return await q.answer(
+                        "Select a Database chat.",
+                        show_alert=True,
                     )
                 if not settings["destination_chat_ids"]:
-                    return await q.edit_message_text(
-                        "Select at least one Destination chat first.",
-                        reply_markup=keyboard([[("⬅️ Back", "back")]]),
+                    return await q.answer(
+                        "Add at least one Destination chat.",
+                        show_alert=True,
                     )
                 await self.db.update_settings(service_enabled=1)
                 try:

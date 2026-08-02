@@ -23,7 +23,8 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "copy_to_database": 1,
     "queue_for_publishing": 1,
     "publish_interval_minutes": 60,
-    "publish_batch_size": 1,
+    "publish_batch_size": 3,
+    "performance_mode": "balanced",
     "service_enabled": 0,
     "updated_at": None,
 }
