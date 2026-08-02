@@ -79,9 +79,10 @@ class ControlBot:
             return await self.show_main(update)
 
         if action == "connect":
-            context.user_data["state"] = "api_id"
+            context.user_data["state"] = "phone"
             return await q.edit_message_text(
-                "Send your Telegram <b>API ID</b>.",
+                "Send your phone number with country code, for example "
+                "<code>+91XXXXXXXXXX</code>.",
                 parse_mode="HTML",
                 reply_markup=keyboard([[("⬅️ Back", "back")]]),
             )
@@ -186,22 +187,12 @@ class ControlBot:
             return
 
         try:
-            if state == "api_id":
-                context.user_data["api_id"] = int(value)
-                context.user_data["state"] = "api_hash"
-                return await update.message.reply_text("Send your Telegram API Hash.")
-
-            if state == "api_hash":
-                context.user_data["api_hash"] = value
-                context.user_data["state"] = "phone"
-                return await update.message.reply_text(
-                    "Send phone number with country code, for example +91XXXXXXXXXX."
-                )
-
             if state == "phone":
-                api_id = context.user_data["api_id"]
-                api_hash = context.user_data["api_hash"]
-                client = TelegramClient(StringSession(), api_id, api_hash)
+                client = TelegramClient(
+                    StringSession(),
+                    self.config.api_id,
+                    self.config.api_hash,
+                )
                 await client.connect()
                 sent = await client.send_code_request(value)
                 self.pending_clients[update.effective_user.id] = client
@@ -211,7 +202,9 @@ class ControlBot:
                     state="otp",
                 )
                 return await update.message.reply_text(
-                    "OTP sent. Enter digits separated by spaces, for example: 1 2 3 4 5"
+                    "OTP sent. Enter digits separated by spaces, for example: "
+                    "<code>1 2 3 4 5</code>",
+                    parse_mode="HTML",
                 )
 
             if state == "otp":
@@ -263,9 +256,9 @@ class ControlBot:
     async def finish_login(self, update, context, client):
         session = StringSession.save(client.session)
         await self.db.update_settings(
-            api_id=context.user_data["api_id"],
+            api_id=self.config.api_id,
             api_hash_encrypted=encrypt_text(
-                self.fernet, context.user_data["api_hash"]
+                self.fernet, self.config.api_hash
             ),
             phone_number=context.user_data["phone"],
             session_encrypted=encrypt_text(self.fernet, session),

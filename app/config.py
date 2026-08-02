@@ -20,6 +20,8 @@ def required(name: str) -> str:
 class AppConfig:
     bot_token: str
     owner_id: int
+    api_id: int
+    api_hash: str
     master_key: str | None
     sqlite_path: Path
     temp_dir: Path
@@ -30,6 +32,8 @@ def load_app_config() -> AppConfig:
     config = AppConfig(
         bot_token=required("BOT_TOKEN"),
         owner_id=int(required("OWNER_ID")),
+        api_id=int(required("API_ID")),
+        api_hash=required("API_HASH"),
         master_key=os.getenv("MASTER_KEY", "").strip() or None,
         sqlite_path=Path(os.getenv("SQLITE_PATH", "data/media_manager.sqlite3")),
         temp_dir=Path(os.getenv("TEMP_DIR", "data/tmp")),
