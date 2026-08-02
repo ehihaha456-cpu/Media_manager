@@ -24,6 +24,7 @@ class MediaRuntime:
         self.scheduler = None
         self._process_lock = asyncio.Lock()
         self._started = False
+        self._generated_database_messages: set[tuple[int, int]] = set()
 
     async def start(self):
         settings = await self.db.get_settings()
@@ -119,6 +120,7 @@ class MediaRuntime:
 
     async def stop(self):
         self._started = False
+        self._generated_database_messages.clear()
 
         if self.scheduler:
             self.scheduler.shutdown(wait=False)
@@ -226,7 +228,38 @@ class MediaRuntime:
                         == current_message_id
                     )
 
-                    if same_original:
+                    existing_database_chat = existing.get(
+                        "database_chat_id"
+                    )
+                    existing_database_message = existing.get(
+                        "database_message_id"
+                    )
+                    same_database_copy = (
+                        existing_database_chat is not None
+                        and existing_database_message is not None
+                        and int(existing_database_chat) == current_chat_id
+                        and int(existing_database_message)
+                        == current_message_id
+                    )
+
+                    generated_database_copy = (
+                        current_chat_id,
+                        current_message_id,
+                    ) in self._generated_database_messages
+
+                    if generated_database_copy:
+                        self._generated_database_messages.discard(
+                            (current_chat_id, current_message_id)
+                        )
+                        log.info(
+                            "Ignored self-created database copy: "
+                            "chat=%s message=%s",
+                            current_chat_id,
+                            current_message_id,
+                        )
+                        return
+
+                    if same_original or same_database_copy:
                         return
 
                     log.info(
@@ -238,22 +271,41 @@ class MediaRuntime:
                         existing["source_message_id"],
                     )
 
-                    if settings["delete_duplicates"]:
+                    # Duplicate deletion is intentionally restricted to the
+                    # selected Database chat. Source and destination messages
+                    # must never be deleted.
+                    is_database_duplicate = (
+                        database_chat_id is not None
+                        and current_chat_id == database_chat_id
+                    )
+
+                    if (
+                        is_database_duplicate
+                        and settings["delete_duplicates"]
+                    ):
                         try:
                             await self.client.delete_messages(
                                 current_chat_id,
                                 [current_message_id],
                             )
                             log.info(
-                                "Duplicate deleted: chat=%s message=%s",
+                                "Database duplicate deleted: "
+                                "chat=%s message=%s",
                                 current_chat_id,
                                 current_message_id,
                             )
                         except Exception:
                             log.exception(
-                                "Duplicate could not be deleted. "
+                                "Database duplicate could not be deleted. "
                                 "Connected account needs delete permission."
                             )
+                    else:
+                        log.info(
+                            "Duplicate retained because it is outside "
+                            "the Database chat: chat=%s message=%s",
+                            current_chat_id,
+                            current_message_id,
+                        )
                     return
 
                 media_id = await self.db.add_media(
@@ -280,6 +332,10 @@ class MediaRuntime:
                         path,
                         caption=message.message or None,
                         supports_streaming=(kind == "video"),
+                    )
+
+                    self._generated_database_messages.add(
+                        (database_chat_id, int(sent.id))
                     )
 
                     await self.db.set_database_message(
