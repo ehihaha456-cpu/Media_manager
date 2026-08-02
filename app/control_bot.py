@@ -106,16 +106,45 @@ class ControlBot:
             return await self.show_main(update)
 
         if action in {"source", "database", "destination"}:
-            context.user_data["state"] = action
-            instructions = {
-                "source": "Send source chat IDs separated by commas.",
-                "database": "Send one database channel/group ID.",
-                "destination": "Send destination chat IDs separated by commas.",
-            }
-            return await q.edit_message_text(
-                instructions[action] + "\n\nUse /chats to view accessible chat IDs.",
-                reply_markup=keyboard([[("⬅️ Back", "back")]]),
-            )
+            return await self.show_chat_selector(update, context, action)
+
+        if action.startswith("pickchat:"):
+            _, mode, raw_chat_id = action.split(":", 2)
+            chat_id = int(raw_chat_id)
+            settings = await self.db.get_settings()
+
+            if mode == "database":
+                await self.db.update_settings(database_chat_id=chat_id)
+                await q.answer("Database chat selected ✅", show_alert=False)
+                return await self.show_main(update)
+
+            if mode == "source":
+                selected = [int(x) for x in settings["source_chat_ids"]]
+                if chat_id in selected:
+                    selected.remove(chat_id)
+                    message = "Source removed"
+                else:
+                    selected.append(chat_id)
+                    message = "Source selected"
+                await self.db.update_settings(source_chat_ids=selected)
+                await q.answer(message, show_alert=False)
+                return await self.show_chat_selector(update, context, "source")
+
+            if mode == "destination":
+                selected = [int(x) for x in settings["destination_chat_ids"]]
+                if chat_id in selected:
+                    selected.remove(chat_id)
+                    message = "Destination removed"
+                else:
+                    selected.append(chat_id)
+                    message = "Destination selected"
+                await self.db.update_settings(destination_chat_ids=selected)
+                await q.answer(message, show_alert=False)
+                return await self.show_chat_selector(update, context, "destination")
+
+        if action == "selector_done":
+            context.user_data.pop("selector_mode", None)
+            return await self.show_main(update)
 
         if action == "duplicates":
             enabled = bool(settings["delete_duplicates"])
@@ -229,18 +258,6 @@ class ControlBot:
                 await client.sign_in(password=value)
                 return await self.finish_login(update, context, client)
 
-            if state in {"source", "destination"}:
-                ids = [int(x.strip()) for x in value.split(",") if x.strip()]
-                key = "source_chat_ids" if state == "source" else "destination_chat_ids"
-                await self.db.update_settings(**{key: ids})
-                context.user_data.clear()
-                return await self.show_main(update)
-
-            if state == "database":
-                await self.db.update_settings(database_chat_id=int(value))
-                context.user_data.clear()
-                return await self.show_main(update)
-
             if state == "interval":
                 minutes = max(1, int(value))
                 await self.db.update_settings(publish_interval_minutes=minutes)
@@ -295,6 +312,83 @@ class ControlBot:
         await update.message.reply_text(
             "Accessible chats:\n\n" + "\n".join(lines),
             parse_mode="HTML",
+        )
+
+
+    async def get_accessible_chats(self):
+        settings = await self.db.get_settings()
+        if not settings["session_encrypted"]:
+            raise RuntimeError("Connect Telegram account first.")
+
+        api_hash = decrypt_text(self.fernet, settings["api_hash_encrypted"])
+        session = decrypt_text(self.fernet, settings["session_encrypted"])
+
+        client = TelegramClient(
+            StringSession(session),
+            int(settings["api_id"]),
+            api_hash,
+        )
+        await client.connect()
+
+        chats = []
+        try:
+            async for dialog in client.iter_dialogs():
+                entity = dialog.entity
+                is_group_or_channel = bool(
+                    getattr(entity, "megagroup", False)
+                    or getattr(entity, "broadcast", False)
+                    or entity.__class__.__name__ in {"Chat", "Channel"}
+                )
+                if not is_group_or_channel:
+                    continue
+
+                chats.append({
+                    "id": int(dialog.id),
+                    "name": dialog.name or str(dialog.id),
+                    "protected": bool(getattr(entity, "noforwards", False)),
+                })
+
+                if len(chats) >= 80:
+                    break
+        finally:
+            await client.disconnect()
+
+        return chats
+
+    async def show_chat_selector(self, update, context, mode):
+        try:
+            chats = await self.get_accessible_chats()
+        except Exception as exc:
+            return await update.callback_query.answer(str(exc), show_alert=True)
+
+        if not chats:
+            return await update.callback_query.edit_message_text(
+                "No accessible groups or channels were found.",
+                reply_markup=keyboard([[("⬅️ Back", "back")]]),
+            )
+
+        context.user_data["selector_mode"] = mode
+        rows = []
+        for chat in chats[:40]:
+            label = chat["name"]
+            if len(label) > 34:
+                label = label[:31] + "..."
+            if chat["protected"]:
+                label += " 🔒"
+            rows.append([(label, f"pickchat:{mode}:{chat['id']}")])
+
+        if mode == "source":
+            title = "📥 Select Source Group/Channel"
+        elif mode == "database":
+            title = "🗄 Select Database Group/Channel"
+        else:
+            title = "📤 Select Destination Group/Channel"
+
+        rows.append([("✅ Done", "selector_done"), ("⬅️ Back", "back")])
+
+        await update.callback_query.edit_message_text(
+            title + "\n\nTap a chat to select it.",
+            reply_markup=keyboard(rows),
         )
 
     def build(self):
