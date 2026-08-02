@@ -1,5 +1,11 @@
-from pathlib import Path
+from __future__ import annotations
+
 import hashlib
+from pathlib import Path
+
+
+VIDEO_MIME_PREFIXES = ("video/",)
+PHOTO_MIME_PREFIXES = ("image/",)
 
 
 def sha256_file(path: Path) -> str:
@@ -11,8 +17,19 @@ def sha256_file(path: Path) -> str:
 
 
 def media_kind(message) -> str | None:
-    if message.photo:
+    if getattr(message, "photo", None):
         return "photo"
-    if message.video:
+
+    if getattr(message, "video", None):
         return "video"
+
+    document = getattr(message, "document", None)
+    mime_type = (getattr(document, "mime_type", "") or "").lower()
+
+    if mime_type.startswith(VIDEO_MIME_PREFIXES):
+        return "video"
+
+    if mime_type.startswith(PHOTO_MIME_PREFIXES):
+        return "photo"
+
     return None

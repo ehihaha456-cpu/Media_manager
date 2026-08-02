@@ -218,6 +218,9 @@ class ControlBot:
                     selected.append(chat_id)
                     message = "Destination selected"
                 await self.db.update_settings(destination_chat_ids=selected)
+                updated = await self.db.get_settings()
+                if updated["service_enabled"]:
+                    await self.runtime.restart()
                 await q.answer(message, show_alert=False)
                 return await self.show_chat_selector(update, context, "destination")
 
@@ -240,6 +243,9 @@ class ControlBot:
         if action == "toggle_duplicates":
             new_value = 0 if settings["delete_duplicates"] else 1
             await self.db.update_settings(delete_duplicates=new_value)
+            updated = await self.db.get_settings()
+            if updated["service_enabled"]:
+                await self.runtime.restart()
             return await q.edit_message_text(
                 f"🧹 <b>Duplicate Settings</b>\\n\\nAuto delete: "
                 f"{'Enabled ✅' if new_value else 'Disabled ❌'}",
@@ -265,8 +271,21 @@ class ControlBot:
             else:
                 if not settings["session_encrypted"]:
                     return await q.answer("Connect Telegram account first.", show_alert=True)
-                if not settings["source_chat_ids"]:
-                    return await q.answer("Add at least one source chat.", show_alert=True)
+                if not settings["source_chat_ids"] and not settings["database_chat_id"]:
+                    return await q.edit_message_text(
+                        "Select at least one Source or Database chat first.",
+                        reply_markup=keyboard([[("⬅️ Back", "back")]]),
+                    )
+                if not settings["database_chat_id"]:
+                    return await q.edit_message_text(
+                        "Select a Database chat first.",
+                        reply_markup=keyboard([[("⬅️ Back", "back")]]),
+                    )
+                if not settings["destination_chat_ids"]:
+                    return await q.edit_message_text(
+                        "Select at least one Destination chat first.",
+                        reply_markup=keyboard([[("⬅️ Back", "back")]]),
+                    )
                 await self.db.update_settings(service_enabled=1)
                 try:
                     await self.runtime.start()

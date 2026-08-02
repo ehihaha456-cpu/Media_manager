@@ -22,7 +22,8 @@ class MediaRuntime:
         self.temp_dir = temp_dir
         self.client = None
         self.scheduler = None
-        self._generated_database_messages: set[tuple[int, int]] = set()
+        self._process_lock = asyncio.Lock()
+        self._started = False
 
     async def start(self):
         settings = await self.db.get_settings()
@@ -30,7 +31,7 @@ class MediaRuntime:
         if not settings["service_enabled"]:
             return
 
-        if self.client and self.client.is_connected():
+        if self._started and self.client and self.client.is_connected():
             return
 
         api_hash = decrypt_text(
@@ -45,6 +46,12 @@ class MediaRuntime:
         if not settings["api_id"] or not api_hash or not session:
             raise RuntimeError("Telegram account is not connected")
 
+        watched_ids = self._watched_chat_ids(settings)
+        if not watched_ids:
+            raise RuntimeError(
+                "Select at least one Source or Database chat"
+            )
+
         self.client = TelegramClient(
             StringSession(session),
             int(settings["api_id"]),
@@ -57,28 +64,22 @@ class MediaRuntime:
                 "Saved Telegram session is no longer authorized"
             )
 
-        source_ids = {
-            int(chat_id)
-            for chat_id in settings["source_chat_ids"]
-        }
-        database_chat_id = (
-            int(settings["database_chat_id"])
-            if settings["database_chat_id"]
-            else None
-        )
-
-        watched_ids = set(source_ids)
-        if database_chat_id is not None:
-            watched_ids.add(database_chat_id)
-
-        if not watched_ids:
-            raise RuntimeError(
-                "Select at least one source or database chat"
-            )
-
-        @self.client.on(events.NewMessage(chats=list(watched_ids)))
+        # Listen globally and check the latest database settings dynamically.
+        # This prevents stale source/database filters after a setting change.
+        @self.client.on(events.NewMessage())
         async def on_message(event):
-            await self.process_message(event)
+            try:
+                current = await self.db.get_settings()
+                current_watched = self._watched_chat_ids(current)
+                if int(event.chat_id) not in current_watched:
+                    return
+                await self.process_message(event.message, int(event.chat_id))
+            except Exception:
+                log.exception(
+                    "New-message handler failed: chat=%s message=%s",
+                    getattr(event, "chat_id", None),
+                    getattr(event, "id", None),
+                )
 
         self.scheduler = AsyncIOScheduler(timezone="Asia/Kolkata")
         self.scheduler.add_job(
@@ -94,15 +95,31 @@ class MediaRuntime:
             replace_existing=True,
         )
         self.scheduler.start()
+        self._started = True
 
         log.info(
-            "Media runtime started | sources=%s database=%s watched=%s",
-            sorted(source_ids),
-            database_chat_id,
+            "Media runtime started | watched=%s destinations=%s",
             sorted(watched_ids),
+            settings["destination_chat_ids"],
         )
 
+        # Index recent messages so testing does not depend only on messages
+        # posted after the exact service-start moment.
+        asyncio.create_task(self.scan_recent_messages(limit_per_chat=100))
+
+    def _watched_chat_ids(self, settings) -> set[int]:
+        watched = {
+            int(chat_id)
+            for chat_id in settings.get("source_chat_ids", [])
+        }
+        database_chat_id = settings.get("database_chat_id")
+        if database_chat_id:
+            watched.add(int(database_chat_id))
+        return watched
+
     async def stop(self):
+        self._started = False
+
         if self.scheduler:
             self.scheduler.shutdown(wait=False)
             self.scheduler = None
@@ -111,38 +128,67 @@ class MediaRuntime:
             await self.client.disconnect()
             self.client = None
 
-        self._generated_database_messages.clear()
         log.info("Media runtime stopped")
 
     async def restart(self):
         await self.stop()
-        await self.start()
-
-    async def process_message(self, event):
         settings = await self.db.get_settings()
+        if settings["service_enabled"]:
+            await self.start()
 
-        kind = media_kind(event.message)
+    async def scan_recent_messages(self, limit_per_chat: int = 100):
+        if not self.client or not self.client.is_connected():
+            return
+
+        settings = await self.db.get_settings()
+        watched_ids = self._watched_chat_ids(settings)
+
+        for chat_id in watched_ids:
+            try:
+                entity = await self.client.get_entity(chat_id)
+                messages = await self.client.get_messages(
+                    entity,
+                    limit=limit_per_chat,
+                )
+
+                # Oldest to newest gives predictable duplicate behavior.
+                for message in reversed(messages):
+                    if media_kind(message):
+                        await self.process_message(
+                            message,
+                            chat_id,
+                            historical=True,
+                        )
+
+                log.info(
+                    "Recent scan completed: chat=%s checked=%s",
+                    chat_id,
+                    len(messages),
+                )
+            except Exception:
+                log.exception(
+                    "Recent scan failed for chat=%s",
+                    chat_id,
+                )
+
+    async def process_message(
+        self,
+        message,
+        chat_id: int,
+        historical: bool = False,
+    ):
+        if not self.client:
+            return
+
+        kind = media_kind(message)
         if not kind:
             return
 
-        current_chat_id = int(event.chat_id)
-        current_message_id = int(event.id)
+        settings = await self.db.get_settings()
+        current_chat_id = int(chat_id)
+        current_message_id = int(message.id)
 
-        # Ignore the database copy created by this service itself.
-        generated_key = (current_chat_id, current_message_id)
-        if generated_key in self._generated_database_messages:
-            self._generated_database_messages.discard(generated_key)
-            log.info(
-                "Ignored self-created database copy: chat=%s message=%s",
-                current_chat_id,
-                current_message_id,
-            )
-            return
-
-        if (
-            getattr(event.chat, "noforwards", False)
-            or getattr(event.message, "noforwards", False)
-        ):
+        if getattr(message, "noforwards", False):
             log.warning(
                 "Protected media skipped: chat=%s message=%s",
                 current_chat_id,
@@ -152,135 +198,161 @@ class MediaRuntime:
 
         database_chat_id = (
             int(settings["database_chat_id"])
-            if settings["database_chat_id"]
+            if settings.get("database_chat_id")
             else None
         )
 
-        temp = self.temp_dir / uuid4().hex
+        temp = self.temp_dir / f"media_{uuid4().hex}"
 
-        try:
-            downloaded = await event.message.download_media(
-                file=str(temp)
-            )
-            if not downloaded:
-                log.warning(
-                    "Media download failed: chat=%s message=%s",
+        async with self._process_lock:
+            try:
+                downloaded = await message.download_media(file=str(temp))
+                if not downloaded:
+                    log.warning(
+                        "Media download returned no file: chat=%s message=%s",
+                        current_chat_id,
+                        current_message_id,
+                    )
+                    return
+
+                path = Path(downloaded)
+                digest = await asyncio.to_thread(sha256_file, path)
+                existing = await self.db.find_by_hash(digest)
+
+                if existing:
+                    same_original = (
+                        int(existing["source_chat_id"]) == current_chat_id
+                        and int(existing["source_message_id"])
+                        == current_message_id
+                    )
+
+                    if same_original:
+                        return
+
+                    log.info(
+                        "Duplicate detected: chat=%s message=%s "
+                        "original=%s/%s",
+                        current_chat_id,
+                        current_message_id,
+                        existing["source_chat_id"],
+                        existing["source_message_id"],
+                    )
+
+                    if settings["delete_duplicates"]:
+                        try:
+                            await self.client.delete_messages(
+                                current_chat_id,
+                                [current_message_id],
+                            )
+                            log.info(
+                                "Duplicate deleted: chat=%s message=%s",
+                                current_chat_id,
+                                current_message_id,
+                            )
+                        except Exception:
+                            log.exception(
+                                "Duplicate could not be deleted. "
+                                "Connected account needs delete permission."
+                            )
+                    return
+
+                media_id = await self.db.add_media(
+                    digest,
+                    kind,
+                    path.stat().st_size,
                     current_chat_id,
                     current_message_id,
-                )
-                return
-
-            path = Path(downloaded)
-            digest = await asyncio.to_thread(sha256_file, path)
-            existing = await self.db.find_by_hash(digest)
-
-            if existing:
-                log.info(
-                    "Duplicate detected: chat=%s message=%s",
-                    current_chat_id,
-                    current_message_id,
+                    message.message or None,
                 )
 
-                if settings["delete_duplicates"]:
-                    try:
-                        await event.delete()
-                        log.info(
-                            "Duplicate deleted: chat=%s message=%s",
-                            current_chat_id,
-                            current_message_id,
+                is_database_message = (
+                    database_chat_id is not None
+                    and current_chat_id == database_chat_id
+                )
+
+                if (
+                    settings["copy_to_database"]
+                    and database_chat_id is not None
+                    and not is_database_message
+                ):
+                    sent = await self.client.send_file(
+                        database_chat_id,
+                        path,
+                        caption=message.message or None,
+                        supports_streaming=(kind == "video"),
+                    )
+
+                    await self.db.set_database_message(
+                        media_id,
+                        database_chat_id,
+                        int(sent.id),
+                    )
+
+                    log.info(
+                        "Copied source media to database: "
+                        "source=%s/%s database=%s/%s",
+                        current_chat_id,
+                        current_message_id,
+                        database_chat_id,
+                        sent.id,
+                    )
+
+                if settings["queue_for_publishing"]:
+                    queued = 0
+                    for destination in settings["destination_chat_ids"]:
+                        destination_id = int(destination)
+
+                        if destination_id == current_chat_id:
+                            continue
+
+                        await self.db.enqueue(
+                            media_id,
+                            destination_id,
                         )
-                    except Exception:
-                        log.exception(
-                            "Duplicate could not be deleted. "
-                            "Connected account needs delete permission."
-                        )
-                return
+                        queued += 1
 
-            media_id = await self.db.add_media(
-                digest,
-                kind,
-                path.stat().st_size,
-                current_chat_id,
-                current_message_id,
-                event.message.message or None,
-            )
-
-            is_database_message = (
-                database_chat_id is not None
-                and current_chat_id == database_chat_id
-            )
-
-            if (
-                settings["copy_to_database"]
-                and database_chat_id is not None
-                and not is_database_message
-            ):
-                sent = await self.client.send_file(
-                    database_chat_id,
-                    path,
-                    caption=event.message.message or None,
-                    supports_streaming=(kind == "video"),
-                )
-
-                self._generated_database_messages.add(
-                    (database_chat_id, int(sent.id))
-                )
-
-                await self.db.set_database_message(
-                    media_id,
-                    database_chat_id,
-                    int(sent.id),
-                )
+                    log.info(
+                        "Media queued: media_id=%s destinations=%s",
+                        media_id,
+                        queued,
+                    )
 
                 log.info(
-                    "Copied source media to database: "
-                    "source=%s/%s database=%s/%s",
+                    "Unique media indexed: chat=%s message=%s "
+                    "kind=%s historical=%s",
                     current_chat_id,
                     current_message_id,
-                    database_chat_id,
-                    sent.id,
+                    kind,
+                    historical,
                 )
 
-            if settings["queue_for_publishing"]:
-                for destination in settings["destination_chat_ids"]:
-                    destination_id = int(destination)
-                    if destination_id == current_chat_id:
-                        continue
-                    await self.db.enqueue(media_id, destination_id)
-
-                log.info(
-                    "Queued media for destinations: media_id=%s count=%s",
-                    media_id,
-                    len(settings["destination_chat_ids"]),
+            except Exception:
+                log.exception(
+                    "Media processing failed: chat=%s message=%s",
+                    current_chat_id,
+                    current_message_id,
                 )
-
-            log.info(
-                "Unique media indexed: chat=%s message=%s kind=%s",
-                current_chat_id,
-                current_message_id,
-                kind,
-            )
-
-        except Exception:
-            log.exception(
-                "Media processing failed: chat=%s message=%s",
-                current_chat_id,
-                current_message_id,
-            )
-        finally:
-            temp.unlink(missing_ok=True)
+            finally:
+                try:
+                    Path(temp).unlink(missing_ok=True)
+                except OSError:
+                    pass
 
     async def publish_pending(self):
+        if not self.client or not self.client.is_connected():
+            log.warning("Publish job skipped: MTProto client is disconnected")
+            return
+
         settings = await self.db.get_settings()
         rows = await self.db.pending(
             int(settings["publish_batch_size"])
         )
 
-        log.info("Publish job started | pending_batch=%s", len(rows))
+        log.info("Publish job started | batch=%s", len(rows))
 
         for row in rows:
             queue_id = int(row["queue_id"])
-            temp = None
+            temp = self.temp_dir / f"publish_{uuid4().hex}"
 
             try:
                 source_chat_id = (
@@ -292,11 +364,8 @@ class MediaRuntime:
                     or row["source_message_id"]
                 )
 
-                entity = await self.client.get_entity(
-                    int(source_chat_id)
-                )
                 message = await self.client.get_messages(
-                    entity,
+                    int(source_chat_id),
                     ids=int(source_message_id),
                 )
 
@@ -305,15 +374,11 @@ class MediaRuntime:
                         "Stored media message was not found"
                     )
 
-                if (
-                    getattr(entity, "noforwards", False)
-                    or getattr(message, "noforwards", False)
-                ):
+                if getattr(message, "noforwards", False):
                     raise RuntimeError(
                         "Protected source content was skipped"
                     )
 
-                temp = self.temp_dir / f"publish_{uuid4().hex}"
                 downloaded = await message.download_media(
                     file=str(temp)
                 )
@@ -323,6 +388,7 @@ class MediaRuntime:
                     )
 
                 path = Path(downloaded)
+
                 await self.client.send_file(
                     int(row["destination_chat_id"]),
                     path,
@@ -334,6 +400,7 @@ class MediaRuntime:
                 )
 
                 await self.db.mark_published(queue_id)
+
                 log.info(
                     "Published media: queue=%s destination=%s",
                     queue_id,
@@ -347,5 +414,7 @@ class MediaRuntime:
                     queue_id,
                 )
             finally:
-                if temp:
+                try:
                     Path(temp).unlink(missing_ok=True)
+                except OSError:
+                    pass
