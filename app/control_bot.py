@@ -188,6 +188,9 @@ class ControlBot:
 
             if mode == "database":
                 await self.db.update_settings(database_chat_id=chat_id)
+                updated = await self.db.get_settings()
+                if updated["service_enabled"]:
+                    await self.runtime.restart()
                 await q.answer("Database chat selected ✅", show_alert=False)
                 return await self.show_main(update)
 
@@ -200,6 +203,9 @@ class ControlBot:
                     selected.append(chat_id)
                     message = "Source selected"
                 await self.db.update_settings(source_chat_ids=selected)
+                updated = await self.db.get_settings()
+                if updated["service_enabled"]:
+                    await self.runtime.restart()
                 await q.answer(message, show_alert=False)
                 return await self.show_chat_selector(update, context, "source")
 
