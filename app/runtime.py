@@ -885,26 +885,83 @@ class MediaRuntime:
 
         for row in rows:
             queue_id = int(row["queue_id"])
+            temp_path: Path | None = None
+
             try:
                 message = await self.client.get_messages(
                     int(row["database_chat_id"]),
                     ids=int(row["database_message_id"]),
                 )
-                if not message:
-                    raise RuntimeError(
-                        "Database media message was not found"
+
+                # Old queue records may point to a Database message that was
+                # deleted. Fall back to the original Source message.
+                if not message or not getattr(message, "media", None):
+                    message = await self.client.get_messages(
+                        int(row["source_chat_id"]),
+                        ids=int(row["source_message_id"]),
                     )
 
-                await self.client.send_file(
-                    int(row["destination_chat_id"]),
-                    message.media,
-                    caption=row["caption"] or None,
-                    supports_streaming=(
-                        media_kind(message) == "video"
-                    ),
-                )
+                if not message or not getattr(message, "media", None):
+                    error_text = (
+                        "Database and Source media messages were not found"
+                    )
+                    await self.db.publish_queue.update_one(
+                        {"_id": queue_id},
+                        {
+                            "$set": {
+                                "status": "failed",
+                                "last_error": error_text,
+                            },
+                            "$inc": {"attempts": 1},
+                        },
+                    )
+                    log.error(
+                        "Queue item permanently failed: queue=%s reason=%s",
+                        queue_id,
+                        error_text,
+                    )
+                    continue
+
+                destination_id = int(row["destination_chat_id"])
+                kind = media_kind(message)
+
+                try:
+                    # Fast server-side copy where Telegram allows it.
+                    await self.client.send_file(
+                        destination_id,
+                        message.media,
+                        caption=row["caption"] or None,
+                        supports_streaming=(kind == "video"),
+                    )
+                except Exception:
+                    # Protected/restricted chats may reject direct media reuse.
+                    # Download and re-upload as a reliable fallback.
+                    temp_path = self.temp_dir / (
+                        f"publish_{queue_id}_{uuid4().hex}"
+                    )
+                    downloaded = await message.download_media(
+                        file=str(temp_path)
+                    )
+                    if not downloaded:
+                        raise RuntimeError(
+                            "Media download fallback returned no file"
+                        )
+
+                    temp_path = Path(downloaded)
+                    await self.client.send_file(
+                        destination_id,
+                        temp_path,
+                        caption=row["caption"] or None,
+                        supports_streaming=(kind == "video"),
+                    )
 
                 await self.db.mark_published(queue_id)
+
+                log.info(
+                    "Published queued media: queue=%s destination=%s",
+                    queue_id,
+                    destination_id,
+                )
 
             except Exception as exc:
                 await self.db.mark_failed(queue_id, exc)
@@ -912,3 +969,6 @@ class MediaRuntime:
                     "Scheduled publishing failed: queue=%s",
                     queue_id,
                 )
+            finally:
+                if temp_path:
+                    temp_path.unlink(missing_ok=True)
