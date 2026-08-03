@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from telethon import TelegramClient
 from telethon.errors import SessionPasswordNeededError, PhoneCodeInvalidError
 from telethon.sessions import StringSession
@@ -485,12 +486,40 @@ class ControlBot:
                 return await self.finish_login(update, context, client)
 
             if state == "interval":
-                minutes = max(1, int(value))
-                await self.db.update_settings(publish_interval_minutes=minutes)
+                raw = value.strip().lower()
+
+                match = re.fullmatch(
+                    r"(\\d+)\\s*(m|min|mins|minute|minutes)?",
+                    raw,
+                )
+                hour_match = re.fullmatch(
+                    r"(\\d+)\\s*(h|hr|hrs|hour|hours)",
+                    raw,
+                )
+
+                if hour_match:
+                    minutes = int(hour_match.group(1)) * 60
+                elif match:
+                    minutes = int(match.group(1))
+                else:
+                    return await update.message.reply_text(
+                        "Send a valid interval, for example: "
+                        "<code>1</code>, <code>1m</code>, "
+                        "<code>60 minutes</code>, or <code>2h</code>.",
+                        parse_mode="HTML",
+                    )
+
+                minutes = max(1, minutes)
+
+                await self.db.update_settings(
+                    publish_interval_minutes=minutes
+                )
                 context.user_data.clear()
+
                 settings = await self.db.get_settings()
                 if settings["service_enabled"]:
                     await self.runtime.restart()
+
                 return await self.show_main(update)
         except Exception as exc:
             log.exception("Control input failed")
