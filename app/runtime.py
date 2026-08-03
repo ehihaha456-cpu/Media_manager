@@ -176,292 +176,292 @@ class MediaRuntime:
 
 
 
-async def _poll_database_chat(
-    self,
-    chat_id: int,
-) -> None:
-    offset = await self.db.get_chat_offset(chat_id)
-
-    if offset is None:
-        messages = list(
-            reversed(
-                await self.client.get_messages(
-                    chat_id,
-                    limit=INITIAL_RECENT_MESSAGES,
+    async def _poll_database_chat(
+        self,
+        chat_id: int,
+    ) -> None:
+        offset = await self.db.get_chat_offset(chat_id)
+    
+        if offset is None:
+            messages = list(
+                reversed(
+                    await self.client.get_messages(
+                        chat_id,
+                        limit=INITIAL_RECENT_MESSAGES,
+                    )
                 )
             )
-        )
-    else:
-        messages = await self.client.get_messages(
-            chat_id,
-            min_id=int(offset),
-            limit=100,
-            reverse=True,
-        )
-
-    batches: list[list] = []
-    album_map: dict[int, list] = {}
-    single_batch: list = []
-
-    for message in messages:
-        message_id = int(message.id)
-        kind = media_kind(message)
-
-        if not kind:
-            if single_batch:
-                batches.append(single_batch)
-                single_batch = []
-
-            grouped_id = getattr(message, "grouped_id", None)
-            if grouped_id and int(grouped_id) in album_map:
-                batches.append(album_map.pop(int(grouped_id)))
-
-            await self.db.set_chat_offset(chat_id, message_id)
-            continue
-
-        # Media uploaded by the runtime from a Source chat was already
-        # registered before this Database scanner sees it.
-        existing_message = await self.db.find_by_database_message(
-            chat_id,
-            message_id,
-        )
-        if existing_message:
-            await self.db.set_chat_offset(chat_id, message_id)
-            continue
-
-        grouped_id = getattr(message, "grouped_id", None)
-        if grouped_id:
-            album_map.setdefault(int(grouped_id), []).append(message)
         else:
-            single_batch.append(message)
-
-    if single_batch:
-        batches.append(single_batch)
-    batches.extend(album_map.values())
-
-    batches.sort(
-        key=lambda batch: min(int(item.id) for item in batch)
-    )
-
-    for batch in batches:
-        batch.sort(key=lambda item: int(item.id))
-        notification_key = await self._register_media_batch(
-            chat_id,
-            batch,
-        )
-
-        for message in batch:
+            messages = await self.client.get_messages(
+                chat_id,
+                min_id=int(offset),
+                limit=100,
+                reverse=True,
+            )
+    
+        batches: list[list] = []
+        album_map: dict[int, list] = {}
+        single_batch: list = []
+    
+        for message in messages:
             message_id = int(message.id)
             kind = media_kind(message)
-
-            try:
-                await self._process_database_message(
-                    chat_id,
-                    message,
-                    kind,
-                    notification_key=notification_key,
-                )
+    
+            if not kind:
+                if single_batch:
+                    batches.append(single_batch)
+                    single_batch = []
+    
+                grouped_id = getattr(message, "grouped_id", None)
+                if grouped_id and int(grouped_id) in album_map:
+                    batches.append(album_map.pop(int(grouped_id)))
+    
                 await self.db.set_chat_offset(chat_id, message_id)
-            except Exception as exc:
-                source_link = await self._message_link(
-                    chat_id,
-                    message_id,
-                )
-                await self._update_notification_result(
-                    notification_key,
-                    failed=1,
-                    failed_item={
-                        "message_id": message_id,
-                        "kind": kind or "unknown",
-                        "reason": (
-                            f"{type(exc).__name__}: {str(exc)}"
-                        )[:300],
-                        "link": source_link,
-                    },
-                )
-                log.exception(
-                    "Database media scan failed: chat=%s message=%s",
-                    chat_id,
-                    message_id,
-                )
-                return
-
-async def _process_database_message(
-    self,
-    database_chat_id: int,
-    message,
-    kind: str,
-    *,
-    notification_key: str,
-) -> None:
-    settings = await self.db.get_settings()
-    temp = self.temp_dir / f"database_{uuid4().hex}"
-
-    async with self.processing_lock:
-        try:
-            downloaded = await message.download_media(file=str(temp))
-            if not downloaded:
-                raise RuntimeError(
-                    "Database media download returned no file"
-                )
-
-            path = Path(downloaded)
-            digest = await asyncio.to_thread(sha256_file, path)
-            existing = await self.db.find_by_hash(digest)
-
-            if existing:
-                original_chat_id = int(
-                    existing.get("database_chat_id")
-                    or existing.get("source_chat_id")
-                )
-                original_message_id = int(
-                    existing.get("database_message_id")
-                    or existing.get("source_message_id")
-                )
-
-                # The current message is already the canonical original.
-                if (
-                    original_chat_id == int(database_chat_id)
-                    and original_message_id == int(message.id)
-                ):
+                continue
+    
+            # Media uploaded by the runtime from a Source chat was already
+            # registered before this Database scanner sees it.
+            existing_message = await self.db.find_by_database_message(
+                chat_id,
+                message_id,
+            )
+            if existing_message:
+                await self.db.set_chat_offset(chat_id, message_id)
+                continue
+    
+            grouped_id = getattr(message, "grouped_id", None)
+            if grouped_id:
+                album_map.setdefault(int(grouped_id), []).append(message)
+            else:
+                single_batch.append(message)
+    
+        if single_batch:
+            batches.append(single_batch)
+        batches.extend(album_map.values())
+    
+        batches.sort(
+            key=lambda batch: min(int(item.id) for item in batch)
+        )
+    
+        for batch in batches:
+            batch.sort(key=lambda item: int(item.id))
+            notification_key = await self._register_media_batch(
+                chat_id,
+                batch,
+            )
+    
+            for message in batch:
+                message_id = int(message.id)
+                kind = media_kind(message)
+    
+                try:
+                    await self._process_database_message(
+                        chat_id,
+                        message,
+                        kind,
+                        notification_key=notification_key,
+                    )
+                    await self.db.set_chat_offset(chat_id, message_id)
+                except Exception as exc:
+                    source_link = await self._message_link(
+                        chat_id,
+                        message_id,
+                    )
                     await self._update_notification_result(
                         notification_key,
-                        processed=1,
+                        failed=1,
+                        failed_item={
+                            "message_id": message_id,
+                            "kind": kind or "unknown",
+                            "reason": (
+                                f"{type(exc).__name__}: {str(exc)}"
+                            )[:300],
+                            "link": source_link,
+                        },
+                    )
+                    log.exception(
+                        "Database media scan failed: chat=%s message=%s",
+                        chat_id,
+                        message_id,
                     )
                     return
-
-                original_message = None
-                try:
-                    original_message = await self.client.get_messages(
-                        original_chat_id,
-                        ids=original_message_id,
+    
+    async def _process_database_message(
+        self,
+        database_chat_id: int,
+        message,
+        kind: str,
+        *,
+        notification_key: str,
+    ) -> None:
+        settings = await self.db.get_settings()
+        temp = self.temp_dir / f"database_{uuid4().hex}"
+    
+        async with self.processing_lock:
+            try:
+                downloaded = await message.download_media(file=str(temp))
+                if not downloaded:
+                    raise RuntimeError(
+                        "Database media download returned no file"
                     )
-                except Exception:
-                    log.exception(
-                        "Database original verification failed: "
-                        "chat=%s message=%s",
+    
+                path = Path(downloaded)
+                digest = await asyncio.to_thread(sha256_file, path)
+                existing = await self.db.find_by_hash(digest)
+    
+                if existing:
+                    original_chat_id = int(
+                        existing.get("database_chat_id")
+                        or existing.get("source_chat_id")
+                    )
+                    original_message_id = int(
+                        existing.get("database_message_id")
+                        or existing.get("source_message_id")
+                    )
+    
+                    # The current message is already the canonical original.
+                    if (
+                        original_chat_id == int(database_chat_id)
+                        and original_message_id == int(message.id)
+                    ):
+                        await self._update_notification_result(
+                            notification_key,
+                            processed=1,
+                        )
+                        return
+    
+                    original_message = None
+                    try:
+                        original_message = await self.client.get_messages(
+                            original_chat_id,
+                            ids=original_message_id,
+                        )
+                    except Exception:
+                        log.exception(
+                            "Database original verification failed: "
+                            "chat=%s message=%s",
+                            original_chat_id,
+                            original_message_id,
+                        )
+    
+                    original_is_valid = bool(
+                        original_message
+                        and media_kind(original_message)
+                    )
+    
+                    if not original_is_valid:
+                        # The hash record points to deleted/missing Telegram
+                        # media. It must not cause the current media to be
+                        # deleted as a duplicate.
+                        await self.db.delete_media_record(
+                            int(existing["_id"])
+                        )
+    
+                        inserted, record = (
+                            await self.db.register_database_media(
+                                sha256=digest,
+                                kind=kind,
+                                size=path.stat().st_size,
+                                database_chat_id=database_chat_id,
+                                database_message_id=int(message.id),
+                                caption=message.message or None,
+                                source_chat_id=database_chat_id,
+                                source_message_id=int(message.id),
+                            )
+                        )
+                        if not inserted:
+                            raise RuntimeError(
+                                "Could not replace stale media record"
+                            )
+    
+                        queued = 0
+                        for destination in settings[
+                            "destination_chat_ids"
+                        ]:
+                            destination_id = int(destination)
+                            if destination_id != database_chat_id:
+                                await self.db.enqueue(
+                                    int(record["id"]),
+                                    destination_id,
+                                )
+                                queued += 1
+    
+                        await self._update_notification_result(
+                            notification_key,
+                            uploaded=1,
+                            queued=queued,
+                            processed=1,
+                        )
+                        return
+    
+                    original_link = await self._message_link(
                         original_chat_id,
                         original_message_id,
                     )
-
-                original_is_valid = bool(
-                    original_message
-                    and media_kind(original_message)
-                )
-
-                if not original_is_valid:
-                    # The hash record points to deleted/missing Telegram
-                    # media. It must not cause the current media to be
-                    # deleted as a duplicate.
-                    await self.db.delete_media_record(
-                        int(existing["_id"])
+                    duplicate_link = await self._message_link(
+                        database_chat_id,
+                        int(message.id),
                     )
-
-                    inserted, record = (
-                        await self.db.register_database_media(
-                            sha256=digest,
-                            kind=kind,
-                            size=path.stat().st_size,
-                            database_chat_id=database_chat_id,
-                            database_message_id=int(message.id),
-                            caption=message.message or None,
-                            source_chat_id=database_chat_id,
-                            source_message_id=int(message.id),
+    
+                    if settings.get("delete_duplicates"):
+                        entity = await self.client.get_entity(
+                            database_chat_id
                         )
-                    )
-                    if not inserted:
-                        raise RuntimeError(
-                            "Could not replace stale media record"
+                        await self.client.delete_messages(
+                            entity,
+                            [int(message.id)],
+                            revoke=True,
                         )
-
-                    queued = 0
-                    for destination in settings[
-                        "destination_chat_ids"
-                    ]:
-                        destination_id = int(destination)
-                        if destination_id != database_chat_id:
-                            await self.db.enqueue(
-                                int(record["id"]),
-                                destination_id,
-                            )
-                            queued += 1
-
+    
                     await self._update_notification_result(
                         notification_key,
-                        uploaded=1,
-                        queued=queued,
+                        duplicate=1,
                         processed=1,
+                        duplicate_pair={
+                            "original_link": original_link,
+                            "duplicate_link": duplicate_link,
+                            "original_chat_id": original_chat_id,
+                            "original_message_id": original_message_id,
+                            "duplicate_chat_id": database_chat_id,
+                            "duplicate_message_id": int(message.id),
+                        },
                     )
                     return
-
-                original_link = await self._message_link(
-                    original_chat_id,
-                    original_message_id,
+    
+                inserted, record = await self.db.register_database_media(
+                    sha256=digest,
+                    kind=kind,
+                    size=path.stat().st_size,
+                    database_chat_id=database_chat_id,
+                    database_message_id=int(message.id),
+                    caption=message.message or None,
+                    source_chat_id=database_chat_id,
+                    source_message_id=int(message.id),
                 )
-                duplicate_link = await self._message_link(
-                    database_chat_id,
-                    int(message.id),
-                )
-
-                if settings.get("delete_duplicates"):
-                    entity = await self.client.get_entity(
-                        database_chat_id
+                if not inserted:
+                    raise RuntimeError(
+                        "Database media registration race detected"
                     )
-                    await self.client.delete_messages(
-                        entity,
-                        [int(message.id)],
-                        revoke=True,
-                    )
-
+    
+                queued = 0
+                for destination in settings["destination_chat_ids"]:
+                    destination_id = int(destination)
+                    if destination_id != database_chat_id:
+                        await self.db.enqueue(
+                            int(record["id"]),
+                            destination_id,
+                        )
+                        queued += 1
+    
                 await self._update_notification_result(
                     notification_key,
-                    duplicate=1,
+                    uploaded=1,
+                    queued=queued,
                     processed=1,
-                    duplicate_pair={
-                        "original_link": original_link,
-                        "duplicate_link": duplicate_link,
-                        "original_chat_id": original_chat_id,
-                        "original_message_id": original_message_id,
-                        "duplicate_chat_id": database_chat_id,
-                        "duplicate_message_id": int(message.id),
-                    },
                 )
-                return
-
-            inserted, record = await self.db.register_database_media(
-                sha256=digest,
-                kind=kind,
-                size=path.stat().st_size,
-                database_chat_id=database_chat_id,
-                database_message_id=int(message.id),
-                caption=message.message or None,
-                source_chat_id=database_chat_id,
-                source_message_id=int(message.id),
-            )
-            if not inserted:
-                raise RuntimeError(
-                    "Database media registration race detected"
-                )
-
-            queued = 0
-            for destination in settings["destination_chat_ids"]:
-                destination_id = int(destination)
-                if destination_id != database_chat_id:
-                    await self.db.enqueue(
-                        int(record["id"]),
-                        destination_id,
-                    )
-                    queued += 1
-
-            await self._update_notification_result(
-                notification_key,
-                uploaded=1,
-                queued=queued,
-                processed=1,
-            )
-        finally:
-            Path(temp).unlink(missing_ok=True)
-
+            finally:
+                Path(temp).unlink(missing_ok=True)
+    
     async def _poll_source_chat(
         self,
         chat_id: int,
