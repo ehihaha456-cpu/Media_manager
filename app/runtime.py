@@ -30,6 +30,7 @@ HISTORY_PAGE_SIZE = 100
 HISTORY_MEDIA_BATCH_SIZE = 10
 HISTORY_PROGRESS_EVERY = 100
 DATABASE_SELF_UPLOAD_GRACE_SECONDS = 15
+DATABASE_SELF_UPLOAD_MARKER = "\u2063"
 UPLOAD_FLOOD_RETRIES = 3
 ENTITY_CACHE_LIMIT = 256
 
@@ -701,6 +702,20 @@ class MediaRuntime:
                 await self.db.set_chat_offset(chat_id, message_id)
                 continue
     
+            # Permanent self-upload identification. The marker is invisible
+            # in Telegram and survives deploys/restarts, unlike memory sets.
+            message_text = str(getattr(message, "message", None) or "")
+            if message_text.startswith(DATABASE_SELF_UPLOAD_MARKER):
+                self.self_uploaded_database_ids.discard(message_id)
+                await self.db.set_chat_offset(chat_id, message_id)
+                log.debug(
+                    "Silently skipping marked runtime Database media: "
+                    "chat=%s message=%s",
+                    chat_id,
+                    message_id,
+                )
+                continue
+
             # Skip media uploaded by this runtime from a Source chat.
             # The message ID is marked immediately after Telegram confirms
             # the Database upload and before MongoDB registration begins.
@@ -1327,6 +1342,14 @@ class MediaRuntime:
                 )
                 await asyncio.sleep(wait_seconds)
 
+    @staticmethod
+    def _database_upload_caption(
+        caption: str | None,
+    ) -> str:
+        # Invisible marker permanently identifies media uploaded by this
+        # runtime. It does not change the visible Telegram caption.
+        return DATABASE_SELF_UPLOAD_MARKER + (caption or "")
+
     async def _try_server_side_copy(
         self,
         target_chat_id: int,
@@ -1434,7 +1457,9 @@ class MediaRuntime:
                         database_chat_id,
                         message,
                         kind,
-                        message.message or None,
+                        self._database_upload_caption(
+                            message.message or None
+                        ),
                     )
                 )
 
@@ -1459,7 +1484,9 @@ class MediaRuntime:
                         path,
                         message,
                         kind,
-                        message.message or None,
+                        self._database_upload_caption(
+                            message.message or None
+                        ),
                     )
 
                 self._mark_self_uploaded_database_message(int(sent.id))
