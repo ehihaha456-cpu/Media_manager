@@ -44,6 +44,7 @@ class Database:
         self.media = self.database["media"]
         self.publish_queue = self.database["publish_queue"]
         self.counters = self.database["counters"]
+        self.chat_offsets = self.database["chat_offsets"]
 
     async def initialize(self) -> None:
         await self.client.admin.command("ping")
@@ -100,6 +101,32 @@ class Database:
             {"$set": values},
             upsert=True,
         )
+
+
+async def get_chat_offset(self, chat_id: int) -> int | None:
+    document = await self.chat_offsets.find_one(
+        {"_id": str(int(chat_id))}
+    )
+    if not document:
+        return None
+    return int(document.get("last_message_id", 0))
+
+async def set_chat_offset(
+    self,
+    chat_id: int,
+    message_id: int,
+) -> None:
+    await self.chat_offsets.update_one(
+        {"_id": str(int(chat_id))},
+        {
+            "$set": {
+                "chat_id": int(chat_id),
+                "last_message_id": int(message_id),
+                "updated_at": now(),
+            }
+        },
+        upsert=True,
+    )
 
     async def find_by_hash(self, sha256: str) -> dict | None:
         document = await self.media.find_one({"sha256": sha256})

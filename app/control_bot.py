@@ -249,6 +249,32 @@ class ControlBot:
                 ]),
             )
 
+        if action == "toggle_duplicate_alerts":
+            new_value = (
+                0 if settings.get("duplicate_alerts", 1)
+                else 1
+            )
+            await self.db.update_settings(
+                duplicate_alerts=new_value
+            )
+            await q.answer(
+                "Owner alerts updated ✅"
+            )
+            settings = await self.db.get_settings()
+            return await q.edit_message_text(
+                "🧹 <b>Duplicate Settings</b>\n\n"
+                f"Auto delete: "
+                f"{'Enabled ✅' if settings['delete_duplicates'] else 'Disabled ❌'}\n"
+                f"Owner alerts: "
+                f"{'Enabled ✅' if settings.get('duplicate_alerts', 1) else 'Disabled ❌'}",
+                parse_mode="HTML",
+                reply_markup=keyboard([
+                    [("Toggle Auto Delete", "toggle_duplicates")],
+                    [("Toggle Owner Alerts", "toggle_duplicate_alerts")],
+                    [("⬅️ Back", "back")],
+                ]),
+            )
+
         if action == "toggle_duplicates":
             new_value = 0 if settings["delete_duplicates"] else 1
             await self.db.update_settings(delete_duplicates=new_value)
@@ -258,6 +284,7 @@ class ControlBot:
                 parse_mode="HTML",
                 reply_markup=keyboard([
                     [("Toggle Auto Delete", "toggle_duplicates")],
+                    [("Toggle Owner Alerts", "toggle_duplicate_alerts")],
                     [("⬅️ Back", "back")],
                 ]),
             )
