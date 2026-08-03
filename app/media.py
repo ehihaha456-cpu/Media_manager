@@ -6,6 +6,7 @@ from pathlib import Path
 
 VIDEO_MIME_PREFIXES = ("video/",)
 PHOTO_MIME_PREFIXES = ("image/",)
+AUDIO_MIME_PREFIXES = ("audio/",)
 
 
 def sha256_file(path: Path) -> str:
@@ -31,5 +32,14 @@ def media_kind(message) -> str | None:
 
     if mime_type.startswith(PHOTO_MIME_PREFIXES):
         return "photo"
+
+    if getattr(message, "audio", None) or getattr(message, "voice", None):
+        return "audio"
+
+    if mime_type.startswith(AUDIO_MIME_PREFIXES):
+        return "audio"
+
+    if document is not None:
+        return "file"
 
     return None

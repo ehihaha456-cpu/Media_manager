@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from telethon import TelegramClient
 from telethon.errors import SessionPasswordNeededError, PhoneCodeInvalidError
@@ -202,18 +203,38 @@ class ControlBot:
 
             if mode == "source":
                 selected = [int(x) for x in settings["source_chat_ids"]]
-                if chat_id in selected:
+                is_new_source = chat_id not in selected
+
+                if not is_new_source:
                     selected.remove(chat_id)
                     message = "Source removed"
+                    await self.db.remove_source_scan(chat_id)
                 else:
                     selected.append(chat_id)
-                    message = "Source selected"
-                await self.db.update_settings(source_chat_ids=selected)
+                    message = "Source selected — scanning started"
+
+                await self.db.update_settings(
+                    source_chat_ids=selected
+                )
+
                 updated = await self.db.get_settings()
                 if updated["service_enabled"]:
                     await self.runtime.restart()
-                await q.answer(message, show_alert=False)
-                return await self.show_chat_selector(update, context, "source")
+
+                if is_new_source:
+                    asyncio.create_task(
+                        self.runtime.register_new_source(chat_id)
+                    )
+
+                await q.answer(
+                    message,
+                    show_alert=False,
+                )
+                return await self.show_chat_selector(
+                    update,
+                    context,
+                    "source",
+                )
 
             if mode == "destination":
                 selected = [int(x) for x in settings["destination_chat_ids"]]
@@ -249,32 +270,6 @@ class ControlBot:
                 ]),
             )
 
-        if action == "toggle_duplicate_alerts":
-            new_value = (
-                0 if settings.get("duplicate_alerts", 1)
-                else 1
-            )
-            await self.db.update_settings(
-                duplicate_alerts=new_value
-            )
-            await q.answer(
-                "Owner alerts updated ✅"
-            )
-            settings = await self.db.get_settings()
-            return await q.edit_message_text(
-                "🧹 <b>Duplicate Settings</b>\n\n"
-                f"Auto delete: "
-                f"{'Enabled ✅' if settings['delete_duplicates'] else 'Disabled ❌'}\n"
-                f"Owner alerts: "
-                f"{'Enabled ✅' if settings.get('duplicate_alerts', 1) else 'Disabled ❌'}",
-                parse_mode="HTML",
-                reply_markup=keyboard([
-                    [("Toggle Auto Delete", "toggle_duplicates")],
-                    [("Toggle Owner Alerts", "toggle_duplicate_alerts")],
-                    [("⬅️ Back", "back")],
-                ]),
-            )
-
         if action == "toggle_duplicates":
             new_value = 0 if settings["delete_duplicates"] else 1
             await self.db.update_settings(delete_duplicates=new_value)
@@ -284,7 +279,6 @@ class ControlBot:
                 parse_mode="HTML",
                 reply_markup=keyboard([
                     [("Toggle Auto Delete", "toggle_duplicates")],
-                    [("Toggle Owner Alerts", "toggle_duplicate_alerts")],
                     [("⬅️ Back", "back")],
                 ]),
             )
