@@ -32,7 +32,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
 
 
 class Database:
-    def __init__(self, mongodb_uri: str, database_name: str):
+    def __init__(self, mongodb_uri: str, database_name: str) -> None:
         self.client = AsyncMongoClient(
             mongodb_uri,
             serverSelectionTimeoutMS=15000,
@@ -85,10 +85,11 @@ class Database:
         result = dict(DEFAULT_SETTINGS)
         result.update(document or {})
         result["source_chat_ids"] = [
-            int(x) for x in result.get("source_chat_ids", [])
+            int(value) for value in result.get("source_chat_ids", [])
         ]
         result["destination_chat_ids"] = [
-            int(x) for x in result.get("destination_chat_ids", [])
+            int(value)
+            for value in result.get("destination_chat_ids", [])
         ]
         return result
 
@@ -102,31 +103,30 @@ class Database:
             upsert=True,
         )
 
+    async def get_chat_offset(self, chat_id: int) -> int | None:
+        document = await self.chat_offsets.find_one(
+            {"_id": str(int(chat_id))}
+        )
+        if document is None:
+            return None
+        return int(document.get("last_message_id", 0))
 
-async def get_chat_offset(self, chat_id: int) -> int | None:
-    document = await self.chat_offsets.find_one(
-        {"_id": str(int(chat_id))}
-    )
-    if document is None:
-        return None
-    return int(document.get("last_message_id", 0))
-
-async def set_chat_offset(
-    self,
-    chat_id: int,
-    message_id: int,
-) -> None:
-    await self.chat_offsets.update_one(
-        {"_id": str(int(chat_id))},
-        {
-            "$set": {
-                "chat_id": int(chat_id),
-                "last_message_id": int(message_id),
-                "updated_at": now(),
-            }
-        },
-        upsert=True,
-    )
+    async def set_chat_offset(
+        self,
+        chat_id: int,
+        message_id: int,
+    ) -> None:
+        await self.chat_offsets.update_one(
+            {"_id": str(int(chat_id))},
+            {
+                "$set": {
+                    "chat_id": int(chat_id),
+                    "last_message_id": int(message_id),
+                    "updated_at": now(),
+                }
+            },
+            upsert=True,
+        )
 
     async def find_by_hash(self, sha256: str) -> dict | None:
         document = await self.media.find_one({"sha256": sha256})
@@ -175,7 +175,11 @@ async def set_chat_offset(
                 raise
             return False, dict(existing)
 
-    async def enqueue(self, media_id: int, destination_chat_id: int) -> None:
+    async def enqueue(
+        self,
+        media_id: int,
+        destination_chat_id: int,
+    ) -> None:
         existing = await self.publish_queue.find_one(
             {
                 "media_id": int(media_id),
