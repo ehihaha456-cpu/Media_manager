@@ -22,13 +22,26 @@ def keyboard(rows):
     ])
 
 
-MAIN = keyboard([
-    [("🔐 Connect Account", "connect"), ("📱 Connected Account", "account")],
-    [("📥 Source Chats", "source"), ("🗄 Database Chat", "database")],
-    [("📤 Destination Chats", "destination")],
-    [("🧹 Duplicate Settings", "duplicates"), ("⏰ Scheduler", "scheduler")],
-    [("▶️ Start / Stop", "service"), ("📊 Statistics", "stats")],
-])
+def main_keyboard(connected: bool):
+    account_button = (
+        ("📱 Connected Account", "account")
+        if connected
+        else ("🔐 Connect Account", "connect")
+    )
+
+    return keyboard([
+        [("▶️ Start / Stop", "service")],
+        [account_button],
+        [
+            ("📥 Source Chats", "source"),
+            ("🗄 Database Chat", "database"),
+        ],
+        [("📤 Destination Chats", "destination")],
+        [
+            ("🧹 Duplicate Settings", "duplicates"),
+            ("⏰ Scheduler", "scheduler"),
+        ],
+    ])
 
 
 class ControlBot:
@@ -200,14 +213,14 @@ class ControlBot:
             await update.callback_query.edit_message_text(
                 body,
                 parse_mode="HTML",
-                reply_markup=MAIN,
+                reply_markup=main_keyboard(connected),
                 disable_web_page_preview=True,
             )
         else:
             await update.effective_message.reply_text(
                 body,
                 parse_mode="HTML",
-                reply_markup=MAIN,
+                reply_markup=main_keyboard(connected),
                 disable_web_page_preview=True,
             )
     
