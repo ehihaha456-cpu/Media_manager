@@ -700,8 +700,22 @@ class MediaRuntime:
                 await self.db.set_chat_offset(chat_id, message_id)
                 continue
     
-            # Media uploaded by the runtime from a Source chat was already
-            # registered before this Database scanner sees it.
+            # Skip media uploaded by this runtime from a Source chat.
+            # The message ID is marked immediately after Telegram confirms
+            # the Database upload and before MongoDB registration begins.
+            if message_id in self.self_uploaded_database_ids:
+                self.self_uploaded_database_ids.discard(message_id)
+                await self.db.set_chat_offset(chat_id, message_id)
+                log.debug(
+                    "Skipping runtime-owned Database media: "
+                    "chat=%s message=%s",
+                    chat_id,
+                    message_id,
+                )
+                continue
+
+            # Permanent fallback: once MongoDB registration completes, the
+            # Database message ID also identifies runtime-owned media.
             existing_message = await self.db.find_by_database_message(
                 chat_id,
                 message_id,
