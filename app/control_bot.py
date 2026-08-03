@@ -143,26 +143,28 @@ class ControlBot:
     
         total = dashboard["total"]
         today = dashboard["today"]
-        pending = int(
-            dashboard.get("database_queue", 0)
-            + dashboard.get("destination_queue", 0)
-        )
     
+        pending = (
+            int(dashboard.get("database_queue", 0))
+            + int(dashboard.get("destination_queue", 0))
+        )
+
         stats_block = (
-            "<pre>"
-            "Total                 Today\n"
-            "────────────────────────────\n"
-            f"Processed  {total['processed']:>7,}   "
-            f"Processed {today['processed']:>7,}\n"
-            f"Uploaded   {total['uploaded']:>7,}   "
-            f"Uploaded  {today['uploaded']:>7,}\n"
-            f"Duplicates {total['duplicates']:>6,}   "
-            f"Duplicate {today['duplicates']:>7,}\n"
-            f"Failed     {total['failed']:>7,}   "
-            f"Failed    {today['failed']:>7,}\n"
-            f"Pending    {pending:>7,}   "
-            f"Pending   {pending:>7,}"
-            "</pre>"
+            "<code>Total                    Today</code>\n"
+            "<code>────────────────────────────</code>\n"
+            f"<code>Processed : {total['processed']:,}</code>"
+            "        "
+            f"<code>Processed : {today['processed']:,}</code>\n"
+            f"<code>Uploaded  : {total['uploaded']:,}</code>"
+            "        "
+            f"<code>Uploaded  : {today['uploaded']:,}</code>\n"
+            f"<code>Duplicate : {total['duplicates']:,}</code>"
+            "        "
+            f"<code>Duplicate : {today['duplicates']:,}</code>\n"
+            f"<code>Failed    : {total['failed']:,}</code>"
+            "        "
+            f"<code>Failed    : {today['failed']:,}</code>\n\n"
+            f"<code>Pending   : {pending:,}</code>"
         )
     
         duplicate_line = (
@@ -177,7 +179,6 @@ class ControlBot:
         body = (
             "🎬 <b>Telegram Media Manager</b>\n\n"
             f"{service_line}\n\n"
-            "━━━━━━━━━━━━━━━━━━━━\n\n"
             "👤 <b>Account</b>\n"
             f"└ {account_text}\n\n"
             "🗄 <b>Database</b>\n"
@@ -187,14 +188,11 @@ class ControlBot:
             f"📤 <b>Destination Chats "
             f"({len(destination_names)})</b>\n"
             f"{destination_lines}\n\n"
-            "━━━━━━━━━━━━━━━━━━━━\n\n"
             "📊 <b>Statistics</b>\n\n"
             f"{stats_block}\n\n"
-            "━━━━━━━━━━━━━━━━━━━━\n\n"
             f"🧹 <b>Duplicate Delete</b> : "
             f"{duplicate_line}\n"
             f"⏰ <b>Scheduler</b> : Every {interval} Minutes\n\n"
-            "━━━━━━━━━━━━━━━━━━━━\n\n"
             "Select an option below."
         )
     
