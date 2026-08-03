@@ -1746,6 +1746,16 @@ class MediaRuntime:
         if not bucket:
             return
 
+        # Persist dashboard counters for every completed media result.
+        # The notification bucket alone is temporary and disappears after
+        # the owner message is finalized, so it cannot power Statistics.
+        await self.db.increment_activity(
+            processed=processed,
+            uploaded=uploaded,
+            duplicates=duplicate,
+            failed=failed,
+        )
+
         bucket["processed"] += processed
         bucket["uploaded"] += uploaded
         bucket["duplicate"] += duplicate
