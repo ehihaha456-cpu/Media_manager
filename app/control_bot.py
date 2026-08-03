@@ -643,11 +643,12 @@ class ControlBot:
                             source_chat_ids=selected
                         )
                         await self.runtime.register_source_history_scan(
-                            chat_id
+                            chat_id,
+                            force=True,
                         )
                     else:
                         await update.message.reply_text(
-                            "Source is already connected."
+                            "Source is already connected. Disconnect and reconnect it to run a fresh full-history scan."
                         )
 
                 elif mode == "destination":

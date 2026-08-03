@@ -175,9 +175,24 @@ class MediaRuntime:
     async def register_source_history_scan(
         self,
         chat_id: int,
+        *,
+        force: bool = False,
     ) -> None:
         chat_id = int(chat_id)
         existing = await self.db.get_source_history_scan(chat_id)
+
+        if force:
+            task = self.source_history_tasks.pop(chat_id, None)
+            if task and not task.done():
+                task.cancel()
+                await asyncio.gather(
+                    task,
+                    return_exceptions=True,
+                )
+
+            await self.db.delete_source_history_scan(chat_id)
+            await self.db.reset_chat_offset(chat_id)
+            existing = None
 
         if existing and existing.get("status") in {
             "pending_count",
@@ -310,7 +325,7 @@ class MediaRuntime:
         await self.alert_bot.send_message(
             chat_id=self.owner_id,
             text=(
-                "✅ <b>New Source Group Detected</b>\n\n"
+                "🔎 <b>Source Full History Scan</b>\n\n"
                 f"Source: <b>{chat_name}</b>\n"
                 f"Chat ID: <code>{chat_id}</code>\n\n"
                 + ("\n".join(media_lines) or "No media found")

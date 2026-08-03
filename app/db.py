@@ -185,6 +185,15 @@ class Database:
         )
 
 
+    async def reset_chat_offset(
+        self,
+        chat_id: int,
+    ) -> None:
+        await self.chat_offsets.delete_one(
+            {"_id": str(int(chat_id))}
+        )
+
+
     async def get_source_history_scan(
         self,
         chat_id: int,
