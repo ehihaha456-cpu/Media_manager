@@ -563,6 +563,13 @@ class MediaRuntime:
         failed_item: dict | None = None,
         duplicate_pair: dict | None = None,
     ) -> None:
+        await self.db.increment_activity(
+            processed=processed + failed,
+            uploaded=uploaded,
+            duplicates=duplicate,
+            failed=failed,
+        )
+
         bucket = self.pending_notifications.get(key)
         if not bucket:
             return

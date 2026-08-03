@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Any
 
 from pymongo import ASCENDING, AsyncMongoClient, ReturnDocument
@@ -45,7 +45,7 @@ class Database:
         self.publish_queue = self.database["publish_queue"]
         self.counters = self.database["counters"]
         self.chat_offsets = self.database["chat_offsets"]
-        self.source_scans = self.database["source_scans"]
+        self.activity_stats = self.database["activity_stats"]
 
     async def initialize(self) -> None:
         await self.client.admin.command("ping")
@@ -89,7 +89,8 @@ class Database:
             int(value) for value in result.get("source_chat_ids", [])
         ]
         result["destination_chat_ids"] = [
-            int(value) for value in result.get("destination_chat_ids", [])
+            int(value)
+            for value in result.get("destination_chat_ids", [])
         ]
         return result
 
@@ -111,7 +112,11 @@ class Database:
             return None
         return int(document.get("last_message_id", 0))
 
-    async def set_chat_offset(self, chat_id: int, message_id: int) -> None:
+    async def set_chat_offset(
+        self,
+        chat_id: int,
+        message_id: int,
+    ) -> None:
         await self.chat_offsets.update_one(
             {"_id": str(int(chat_id))},
             {
@@ -124,34 +129,9 @@ class Database:
             upsert=True,
         )
 
-    async def get_source_scan(self, chat_id: int) -> dict | None:
-        document = await self.source_scans.find_one(
-            {"_id": str(int(chat_id))}
-        )
+    async def find_by_hash(self, sha256: str) -> dict | None:
+        document = await self.media.find_one({"sha256": sha256})
         return dict(document) if document else None
-
-    async def upsert_source_scan(self, chat_id: int, **values) -> None:
-        values["chat_id"] = int(chat_id)
-        values["updated_at"] = now()
-        await self.source_scans.update_one(
-            {"_id": str(int(chat_id))},
-            {
-                "$set": values,
-                "$setOnInsert": {"created_at": now()},
-            },
-            upsert=True,
-        )
-
-    async def pending_source_scans(self) -> list[dict]:
-        cursor = self.source_scans.find(
-            {"status": {"$in": ["counted", "pending", "scanning"]}}
-        )
-        return [dict(item) async for item in cursor]
-
-    async def remove_source_scan(self, chat_id: int) -> None:
-        await self.source_scans.delete_one(
-            {"_id": str(int(chat_id))}
-        )
 
     async def register_database_media(
         self,
@@ -196,7 +176,11 @@ class Database:
                 raise
             return False, dict(existing)
 
-    async def enqueue(self, media_id: int, destination_chat_id: int) -> None:
+    async def enqueue(
+        self,
+        media_id: int,
+        destination_chat_id: int,
+    ) -> None:
         existing = await self.publish_queue.find_one(
             {
                 "media_id": int(media_id),
@@ -244,6 +228,8 @@ class Database:
                     "destination_chat_id": int(
                         queue["destination_chat_id"]
                     ),
+                    "source_chat_id": int(media["source_chat_id"]),
+                    "source_message_id": int(media["source_message_id"]),
                     "database_chat_id": int(media["database_chat_id"]),
                     "database_message_id": int(
                         media["database_message_id"]
@@ -277,6 +263,94 @@ class Database:
                 "$set": {"last_error": str(error)[:1000]},
             },
         )
+
+
+async def increment_activity(
+    self,
+    *,
+    processed: int = 0,
+    uploaded: int = 0,
+    duplicates: int = 0,
+    failed: int = 0,
+) -> None:
+    increments = {
+        "processed": int(processed),
+        "uploaded": int(uploaded),
+        "duplicates": int(duplicates),
+        "failed": int(failed),
+    }
+    increments = {
+        key: value
+        for key, value in increments.items()
+        if value
+    }
+    if not increments:
+        return
+
+    india_now = datetime.now(
+        timezone(timedelta(hours=5, minutes=30))
+    )
+    day_key = india_now.strftime("%Y-%m-%d")
+
+    await self.activity_stats.update_one(
+        {"_id": "total"},
+        {
+            "$inc": increments,
+            "$set": {"updated_at": now()},
+        },
+        upsert=True,
+    )
+    await self.activity_stats.update_one(
+        {"_id": f"day:{day_key}"},
+        {
+            "$inc": increments,
+            "$set": {
+                "date": day_key,
+                "updated_at": now(),
+            },
+        },
+        upsert=True,
+    )
+
+async def dashboard_statistics(self) -> dict:
+    india_now = datetime.now(
+        timezone(timedelta(hours=5, minutes=30))
+    )
+    day_key = india_now.strftime("%Y-%m-%d")
+
+    total = (
+        await self.activity_stats.find_one({"_id": "total"})
+        or {}
+    )
+    today = (
+        await self.activity_stats.find_one(
+            {"_id": f"day:{day_key}"}
+        )
+        or {}
+    )
+
+    destination_queue = (
+        await self.publish_queue.count_documents(
+            {"status": "pending"}
+        )
+    )
+
+    def values(document: dict) -> dict:
+        return {
+            "processed": int(document.get("processed", 0)),
+            "uploaded": int(document.get("uploaded", 0)),
+            "duplicates": int(document.get("duplicates", 0)),
+            "failed": int(document.get("failed", 0)),
+        }
+
+    return {
+        "total": values(total),
+        "today": values(today),
+        # Source -> Database is processed immediately, so there is no
+        # separate persistent Database queue in this engine.
+        "database_queue": 0,
+        "destination_queue": int(destination_queue),
+    }
 
     async def statistics(self) -> dict:
         return {

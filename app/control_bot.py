@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import logging
 from telethon import TelegramClient
 from telethon.errors import SessionPasswordNeededError, PhoneCodeInvalidError
@@ -28,7 +27,6 @@ MAIN = keyboard([
     [("📥 Source Chats", "source"), ("🗄 Database Chat", "database")],
     [("📤 Destination Chats", "destination")],
     [("🧹 Duplicate Settings", "duplicates"), ("⏰ Scheduler", "scheduler")],
-    [("⚡ Performance", "performance")],
     [("▶️ Start / Stop", "service"), ("📊 Statistics", "stats")],
 ])
 
@@ -44,101 +42,176 @@ class ControlBot:
     def owner_only(self, update):
         return bool(update.effective_user and update.effective_user.id == self.config.owner_id)
 
-    async def show_main(self, update, text="Media Manager"):
-        settings = await self.db.get_settings()
 
-        phone = settings["phone_number"] or ""
-        if phone and len(phone) > 6:
-            masked_phone = phone[:3] + "*" * (len(phone) - 6) + phone[-3:]
-        else:
-            masked_phone = phone
+@staticmethod
+def _short_name(value: str | None, limit: int = 32) -> str:
+    text = str(value or "Unknown")
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1] + "…"
 
-        account_status = (
-            f"✅ Connected ({masked_phone})"
-            if settings["session_encrypted"]
-            else "❌ Not connected"
+async def show_main(self, update, text="Media Manager"):
+    settings = await self.db.get_settings()
+    dashboard = await self.db.dashboard_statistics()
+
+    phone = settings.get("phone_number") or ""
+    digits = phone.replace(" ", "")
+    if digits and len(digits) > 7:
+        masked_phone = (
+            digits[:3]
+            + "*" * max(5, len(digits) - 6)
+            + digits[-3:]
         )
-        service_status = (
-            "✅ Running" if settings["service_enabled"] else "⏹ Stopped"
-        )
-        duplicate_status = (
-            "✅ Enabled" if settings["delete_duplicates"] else "❌ Disabled"
-        )
+    else:
+        masked_phone = digits or "Unknown"
 
-        database_name = None
-        source_names = []
-        destination_names = []
+    connected = bool(settings.get("session_encrypted"))
+    account_text = (
+        f"✅ Connected ({masked_phone})"
+        if connected
+        else "❌ Not Connected"
+    )
 
-        if settings["session_encrypted"]:
-            try:
-                chats = await self.get_accessible_chats()
-                chat_names = {int(chat["id"]): chat["name"] for chat in chats}
+    database_name = None
+    source_names: list[str] = []
+    destination_names: list[str] = []
 
-                database_id = settings["database_chat_id"]
-                if database_id:
-                    database_name = chat_names.get(
-                        int(database_id), str(database_id)
-                    )
+    if connected:
+        try:
+            chats = await self.get_accessible_chats()
+            chat_names = {
+                int(chat["id"]): str(chat["name"])
+                for chat in chats
+            }
 
-                source_names = [
-                    chat_names.get(int(chat_id), str(chat_id))
-                    for chat_id in settings["source_chat_ids"]
-                ]
-                destination_names = [
-                    chat_names.get(int(chat_id), str(chat_id))
-                    for chat_id in settings["destination_chat_ids"]
-                ]
-            except Exception:
-                log.exception("Could not resolve chat names for dashboard")
+            database_id = settings.get("database_chat_id")
+            if database_id:
+                database_name = chat_names.get(
+                    int(database_id),
+                    str(database_id),
+                )
 
-        database_status = (
-            f"✅ {database_name}"
-            if database_name
-            else "❌ Not connected"
-        )
-        source_status = (
-            f"✅ {len(source_names)} connected"
-            if source_names
-            else "❌ Not connected"
-        )
-        destination_status = (
-            f"✅ {len(destination_names)} connected"
-            if destination_names
-            else "❌ Not connected"
-        )
-
-        performance_mode = str(
-            settings.get("performance_mode", "balanced")
-        ).title()
-
-        interval = int(settings["publish_interval_minutes"])
-        scheduler_status = (
-            f"✅ Every {interval} minutes"
-            if settings["service_enabled"]
-            else f"⏸ Every {interval} minutes"
-        )
-
-        body = (
-            "🎬 <b>Telegram Media Manager</b>\n\n"
-            f"📱 <b>Account:</b> {account_status}\n"
-            f"🗄 <b>Database:</b> {database_status}\n"
-            f"📥 <b>Sources:</b> {source_status}\n"
-            f"📤 <b>Destinations:</b> {destination_status}\n"
-            f"🧹 <b>Duplicate Delete:</b> {duplicate_status}\n"
-            f"⏰ <b>Scheduler:</b> {scheduler_status}\n"
-            f"⚡ <b>Performance:</b> {performance_mode}\n"
-            f"▶️ <b>Service:</b> {service_status}\n\n"
-            "Select an option below."
-        )
-
-        if update.callback_query:
-            await update.callback_query.edit_message_text(
-                body, parse_mode="HTML", reply_markup=MAIN
+            source_names = [
+                chat_names.get(int(chat_id), str(chat_id))
+                for chat_id in settings.get(
+                    "source_chat_ids",
+                    [],
+                )
+            ]
+            destination_names = [
+                chat_names.get(int(chat_id), str(chat_id))
+                for chat_id in settings.get(
+                    "destination_chat_ids",
+                    [],
+                )
+            ]
+        except Exception:
+            log.exception(
+                "Could not resolve chat names for dashboard"
             )
-        else:
-            await update.effective_message.reply_text(
-                body, parse_mode="HTML", reply_markup=MAIN
-            )
+
+    service_running = bool(settings.get("service_enabled"))
+    service_line = (
+        "🟢 <b>Service Status:</b> Running"
+        if service_running
+        else "🔴 <b>Service Status:</b> Stopped"
+    )
+
+    database_line = (
+        f"└ ✅ {self._short_name(database_name)}"
+        if database_name
+        else "└ ❌ Not Connected"
+    )
+
+    source_lines = (
+        "\n".join(
+            f"└ ✅ {self._short_name(name)}"
+            for name in source_names
+        )
+        if source_names
+        else "└ ❌ No Source Chats"
+    )
+
+    destination_lines = (
+        "\n".join(
+            f"└ ✅ {self._short_name(name)}"
+            for name in destination_names
+        )
+        if destination_names
+        else "└ ❌ No Destination Chats"
+    )
+
+    total = dashboard["total"]
+    today = dashboard["today"]
+
+    stats_block = (
+        "<pre>"
+        "Total                 Today\n"
+        "────────────────────────────\n"
+        f"Processed  {total['processed']:>7,}   "
+        f"Processed {today['processed']:>7,}\n"
+        f"Uploaded   {total['uploaded']:>7,}   "
+        f"Uploaded  {today['uploaded']:>7,}\n"
+        f"Duplicates {total['duplicates']:>6,}   "
+        f"Duplicate {today['duplicates']:>7,}\n"
+        f"Failed     {total['failed']:>7,}   "
+        f"Failed    {today['failed']:>7,}"
+        "</pre>"
+    )
+
+    duplicate_line = (
+        "✅ Enabled"
+        if settings.get("delete_duplicates")
+        else "❌ Disabled"
+    )
+    interval = int(
+        settings.get("publish_interval_minutes", 60)
+    )
+
+    body = (
+        "🎬 <b>Telegram Media Manager</b>\n\n"
+        f"{service_line}\n\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        "👤 <b>Account</b>\n"
+        f"└ {account_text}\n\n"
+        "🗄 <b>Database</b>\n"
+        f"{database_line}\n\n"
+        f"📥 <b>Source Chats ({len(source_names)})</b>\n"
+        f"{source_lines}\n\n"
+        f"📤 <b>Destination Chats "
+        f"({len(destination_names)})</b>\n"
+        f"{destination_lines}\n\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        "📊 <b>Statistics</b>\n\n"
+        f"{stats_block}\n\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        "📦 <b>Queue</b>\n"
+        f"• Database Queue      : "
+        f"{dashboard['database_queue']:,}\n"
+        f"• Destination Queue   : "
+        f"{dashboard['destination_queue']:,}\n\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"🧹 <b>Duplicate Delete</b> : "
+        f"{duplicate_line}\n"
+        f"⏰ <b>Scheduler</b> : Every {interval} Minutes\n\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        "Select an option below."
+    )
+
+    if update.callback_query:
+        await update.callback_query.edit_message_text(
+            body,
+            parse_mode="HTML",
+            reply_markup=MAIN,
+            disable_web_page_preview=True,
+        )
+    else:
+        await update.effective_message.reply_text(
+            body,
+            parse_mode="HTML",
+            reply_markup=MAIN,
+            disable_web_page_preview=True,
+        )
 
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not self.owner_only(update):
@@ -203,38 +276,18 @@ class ControlBot:
 
             if mode == "source":
                 selected = [int(x) for x in settings["source_chat_ids"]]
-                is_new_source = chat_id not in selected
-
-                if not is_new_source:
+                if chat_id in selected:
                     selected.remove(chat_id)
                     message = "Source removed"
-                    await self.db.remove_source_scan(chat_id)
                 else:
                     selected.append(chat_id)
-                    message = "Source selected — scanning started"
-
-                await self.db.update_settings(
-                    source_chat_ids=selected
-                )
-
+                    message = "Source selected"
+                await self.db.update_settings(source_chat_ids=selected)
                 updated = await self.db.get_settings()
                 if updated["service_enabled"]:
                     await self.runtime.restart()
-
-                if is_new_source:
-                    asyncio.create_task(
-                        self.runtime.register_new_source(chat_id)
-                    )
-
-                await q.answer(
-                    message,
-                    show_alert=False,
-                )
-                return await self.show_chat_selector(
-                    update,
-                    context,
-                    "source",
-                )
+                await q.answer(message, show_alert=False)
+                return await self.show_chat_selector(update, context, "source")
 
             if mode == "destination":
                 selected = [int(x) for x in settings["destination_chat_ids"]]
