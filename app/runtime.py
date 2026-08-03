@@ -702,19 +702,32 @@ class MediaRuntime:
                 await self.db.set_chat_offset(chat_id, message_id)
                 continue
     
-            # Permanent self-upload identification. The marker is invisible
-            # in Telegram and survives deploys/restarts, unlike memory sets.
+            # The invisible marker is temporary. Only the exact Database
+            # message already registered by this runtime is silently skipped.
+            # A copied/forwarded marked message has a different message ID and
+            # must continue through normal duplicate detection.
             message_text = str(getattr(message, "message", None) or "")
             if message_text.startswith(DATABASE_SELF_UPLOAD_MARKER):
-                self.self_uploaded_database_ids.discard(message_id)
-                await self.db.set_chat_offset(chat_id, message_id)
-                log.debug(
-                    "Silently skipping marked runtime Database media: "
-                    "chat=%s message=%s",
-                    chat_id,
-                    message_id,
+                registered_marker_message = (
+                    await self.db.find_by_database_message(
+                        chat_id,
+                        message_id,
+                    )
                 )
-                continue
+                if registered_marker_message:
+                    await self._clear_database_upload_marker(
+                        chat_id,
+                        message,
+                    )
+                    self.self_uploaded_database_ids.discard(message_id)
+                    await self.db.set_chat_offset(chat_id, message_id)
+                    log.debug(
+                        "Silently skipping registered runtime Database media: "
+                        "chat=%s message=%s",
+                        chat_id,
+                        message_id,
+                    )
+                    continue
 
             # Skip media uploaded by this runtime from a Source chat.
             # The message ID is marked immediately after Telegram confirms
@@ -1346,9 +1359,42 @@ class MediaRuntime:
     def _database_upload_caption(
         caption: str | None,
     ) -> str:
-        # Invisible marker permanently identifies media uploaded by this
-        # runtime. It does not change the visible Telegram caption.
+        # Temporary invisible marker closes the Telegram/MongoDB registration
+        # race. It is removed immediately after successful registration.
         return DATABASE_SELF_UPLOAD_MARKER + (caption or "")
+
+    async def _clear_database_upload_marker(
+        self,
+        database_chat_id: int,
+        message,
+    ) -> None:
+        current_caption = str(
+            getattr(message, "message", None) or ""
+        )
+        if not current_caption.startswith(DATABASE_SELF_UPLOAD_MARKER):
+            return
+
+        clean_caption = current_caption[len(DATABASE_SELF_UPLOAD_MARKER):]
+        try:
+            target = await self._resolve_peer(database_chat_id)
+            await self.client.edit_message(
+                target,
+                int(message.id),
+                clean_caption,
+            )
+            try:
+                message.message = clean_caption
+            except Exception:
+                pass
+        except Exception:
+            # MongoDB message-ID registration remains the permanent fallback,
+            # so a caption edit failure must never fail media processing.
+            log.warning(
+                "Could not remove temporary Database upload marker: "
+                "chat=%s message=%s",
+                database_chat_id,
+                getattr(message, "id", None),
+            )
 
     async def _try_server_side_copy(
         self,
@@ -1501,6 +1547,12 @@ class MediaRuntime:
                     source_chat_id=source_chat_id,
                     source_message_id=int(message.id),
                 )
+
+                if inserted:
+                    await self._clear_database_upload_marker(
+                        database_chat_id,
+                        sent,
+                    )
 
                 if not inserted:
                     original_chat_id = int(
