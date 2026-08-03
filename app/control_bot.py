@@ -186,9 +186,26 @@ class ControlBot:
             if settings.get("delete_duplicates")
             else "❌ Disabled"
         )
-        interval = int(
-            settings.get("publish_interval_minutes", 60)
+        interval_seconds = int(
+            settings.get(
+                "publish_interval_seconds",
+                int(settings.get(
+                    "publish_interval_minutes",
+                    60,
+                )) * 60,
+            )
         )
+
+        if interval_seconds < 60:
+            interval_text = f"{interval_seconds} Seconds"
+        elif interval_seconds % 3600 == 0:
+            interval_text = (
+                f"{interval_seconds // 3600} Hours"
+            )
+        else:
+            interval_text = (
+                f"{interval_seconds // 60} Minutes"
+            )
     
         body = (
             "🎬 <b>Telegram Media Manager</b>\n\n"
@@ -206,7 +223,7 @@ class ControlBot:
             f"{stats_block}\n\n"
             f"🧹 <b>Duplicate Delete</b> : "
             f"{duplicate_line}\n"
-            f"⏰ <b>Scheduler</b> : Every {interval} Minutes\n\n"
+            f"⏰ <b>Scheduler</b> : Every {interval_text}\n\n"
             "Select an option below."
         )
     
@@ -387,9 +404,36 @@ class ControlBot:
 
         if action == "scheduler":
             context.user_data["state"] = "interval"
+            current_seconds = int(
+                settings.get(
+                    "publish_interval_seconds",
+                    int(settings.get(
+                        "publish_interval_minutes",
+                        60,
+                    )) * 60,
+                )
+            )
+
+            if current_seconds < 60:
+                current_text = f"{current_seconds} seconds"
+            elif current_seconds % 3600 == 0:
+                current_text = (
+                    f"{current_seconds // 3600} hours"
+                )
+            else:
+                current_text = (
+                    f"{current_seconds // 60} minutes"
+                )
+
             return await q.edit_message_text(
-                f"⏰ Current interval: {settings['publish_interval_minutes']} minutes\n\n"
-                "Send the new interval in minutes.",
+                "⏰ <b>Scheduler Interval</b>\n\n"
+                f"Current interval: <b>{current_text}</b>\n\n"
+                "Send a new interval using one of these formats:\n"
+                "• <code>10s</code> or <code>10 seconds</code>\n"
+                "• <code>1m</code> or <code>1 minute</code>\n"
+                "• <code>60 minutes</code>\n"
+                "• <code>2h</code> or <code>2 hours</code>",
+                parse_mode="HTML",
                 reply_markup=keyboard([[("⬅️ Back", "back")]]),
             )
 
@@ -488,31 +532,51 @@ class ControlBot:
             if state == "interval":
                 raw = value.strip().lower()
 
-                match = re.fullmatch(
-                    r"(\\d+)\\s*(m|min|mins|minute|minutes)?",
+                second_match = re.fullmatch(
+                    r"(\d+)\s*(s|sec|secs|second|seconds)",
+                    raw,
+                )
+                minute_match = re.fullmatch(
+                    r"(\d+)\s*(m|min|mins|minute|minutes)?",
                     raw,
                 )
                 hour_match = re.fullmatch(
-                    r"(\\d+)\\s*(h|hr|hrs|hour|hours)",
+                    r"(\d+)\s*(h|hr|hrs|hour|hours)",
                     raw,
                 )
 
-                if hour_match:
-                    minutes = int(hour_match.group(1)) * 60
-                elif match:
-                    minutes = int(match.group(1))
+                if second_match:
+                    interval_seconds = max(
+                        1,
+                        int(second_match.group(1)),
+                    )
+                elif hour_match:
+                    interval_seconds = max(
+                        1,
+                        int(hour_match.group(1)) * 3600,
+                    )
+                elif minute_match:
+                    interval_seconds = max(
+                        1,
+                        int(minute_match.group(1)) * 60,
+                    )
                 else:
                     return await update.message.reply_text(
-                        "Send a valid interval, for example: "
-                        "<code>1</code>, <code>1m</code>, "
-                        "<code>60 minutes</code>, or <code>2h</code>.",
+                        "⏰ <b>Invalid interval</b>\n\n"
+                        "Use one of these formats:\n"
+                        "• <code>10s</code> or <code>10 seconds</code>\n"
+                        "• <code>1m</code> or <code>1 minute</code>\n"
+                        "• <code>60 minutes</code>\n"
+                        "• <code>2h</code> or <code>2 hours</code>",
                         parse_mode="HTML",
                     )
 
-                minutes = max(1, minutes)
-
                 await self.db.update_settings(
-                    publish_interval_minutes=minutes
+                    publish_interval_seconds=interval_seconds,
+                    publish_interval_minutes=max(
+                        1,
+                        interval_seconds // 60,
+                    ),
                 )
                 context.user_data.clear()
 

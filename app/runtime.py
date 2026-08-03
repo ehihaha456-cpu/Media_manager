@@ -81,13 +81,20 @@ class MediaRuntime:
             )
 
         self.scheduler = AsyncIOScheduler(timezone="Asia/Kolkata")
+        interval_seconds = int(
+            settings.get(
+                "publish_interval_seconds",
+                int(settings.get(
+                    "publish_interval_minutes",
+                    60,
+                )) * 60,
+            )
+        )
+
         self.scheduler.add_job(
             self.publish_pending,
             "interval",
-            minutes=max(
-                1,
-                int(settings["publish_interval_minutes"]),
-            ),
+            seconds=max(1, interval_seconds),
             max_instances=1,
             coalesce=True,
             id="publish_pending",
@@ -563,13 +570,6 @@ class MediaRuntime:
         failed_item: dict | None = None,
         duplicate_pair: dict | None = None,
     ) -> None:
-        await self.db.increment_activity(
-            processed=processed + failed,
-            uploaded=uploaded,
-            duplicates=duplicate,
-            failed=failed,
-        )
-
         bucket = self.pending_notifications.get(key)
         if not bucket:
             return
