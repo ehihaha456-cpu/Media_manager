@@ -32,7 +32,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
 
 
 class Database:
-    def __init__(self, mongodb_uri: str, database_name: str):
+    def __init__(self, mongodb_uri: str, database_name: str) -> None:
         self.client = AsyncMongoClient(
             mongodb_uri,
             serverSelectionTimeoutMS=15000,
@@ -44,6 +44,7 @@ class Database:
         self.media = self.database["media"]
         self.publish_queue = self.database["publish_queue"]
         self.counters = self.database["counters"]
+        self.chat_offsets = self.database["chat_offsets"]
         self.source_scans = self.database["source_scans"]
 
     async def initialize(self) -> None:
@@ -85,10 +86,10 @@ class Database:
         result = dict(DEFAULT_SETTINGS)
         result.update(document or {})
         result["source_chat_ids"] = [
-            int(x) for x in result.get("source_chat_ids", [])
+            int(value) for value in result.get("source_chat_ids", [])
         ]
         result["destination_chat_ids"] = [
-            int(x) for x in result.get("destination_chat_ids", [])
+            int(value) for value in result.get("destination_chat_ids", [])
         ]
         return result
 
@@ -102,53 +103,55 @@ class Database:
             upsert=True,
         )
 
+    async def get_chat_offset(self, chat_id: int) -> int | None:
+        document = await self.chat_offsets.find_one(
+            {"_id": str(int(chat_id))}
+        )
+        if document is None:
+            return None
+        return int(document.get("last_message_id", 0))
 
-async def get_source_scan(self, chat_id: int) -> dict | None:
-    document = await self.source_scans.find_one(
-        {"_id": str(int(chat_id))}
-    )
-    return dict(document) if document else None
-
-async def upsert_source_scan(
-    self,
-    chat_id: int,
-    **values,
-) -> None:
-    values["chat_id"] = int(chat_id)
-    values["updated_at"] = now()
-    await self.source_scans.update_one(
-        {"_id": str(int(chat_id))},
-        {
-            "$set": values,
-            "$setOnInsert": {
-                "created_at": now(),
+    async def set_chat_offset(self, chat_id: int, message_id: int) -> None:
+        await self.chat_offsets.update_one(
+            {"_id": str(int(chat_id))},
+            {
+                "$set": {
+                    "chat_id": int(chat_id),
+                    "last_message_id": int(message_id),
+                    "updated_at": now(),
+                }
             },
-        },
-        upsert=True,
-    )
+            upsert=True,
+        )
 
-async def pending_source_scans(self) -> list[dict]:
-    cursor = self.source_scans.find(
-        {
-            "status": {
-                "$in": [
-                    "counted",
-                    "pending",
-                    "scanning",
-                ]
-            }
-        }
-    )
-    return [dict(item) async for item in cursor]
-
-async def remove_source_scan(self, chat_id: int) -> None:
-    await self.source_scans.delete_one(
-        {"_id": str(int(chat_id))}
-    )
-
-    async def find_by_hash(self, sha256: str) -> dict | None:
-        document = await self.media.find_one({"sha256": sha256})
+    async def get_source_scan(self, chat_id: int) -> dict | None:
+        document = await self.source_scans.find_one(
+            {"_id": str(int(chat_id))}
+        )
         return dict(document) if document else None
+
+    async def upsert_source_scan(self, chat_id: int, **values) -> None:
+        values["chat_id"] = int(chat_id)
+        values["updated_at"] = now()
+        await self.source_scans.update_one(
+            {"_id": str(int(chat_id))},
+            {
+                "$set": values,
+                "$setOnInsert": {"created_at": now()},
+            },
+            upsert=True,
+        )
+
+    async def pending_source_scans(self) -> list[dict]:
+        cursor = self.source_scans.find(
+            {"status": {"$in": ["counted", "pending", "scanning"]}}
+        )
+        return [dict(item) async for item in cursor]
+
+    async def remove_source_scan(self, chat_id: int) -> None:
+        await self.source_scans.delete_one(
+            {"_id": str(int(chat_id))}
+        )
 
     async def register_database_media(
         self,
@@ -241,8 +244,6 @@ async def remove_source_scan(self, chat_id: int) -> None:
                     "destination_chat_id": int(
                         queue["destination_chat_id"]
                     ),
-                    "source_chat_id": int(media["source_chat_id"]),
-                    "source_message_id": int(media["source_message_id"]),
                     "database_chat_id": int(media["database_chat_id"]),
                     "database_message_id": int(
                         media["database_message_id"]

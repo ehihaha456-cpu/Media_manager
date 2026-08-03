@@ -4,11 +4,6 @@ import hashlib
 from pathlib import Path
 
 
-VIDEO_MIME_PREFIXES = ("video/",)
-PHOTO_MIME_PREFIXES = ("image/",)
-AUDIO_MIME_PREFIXES = ("audio/",)
-
-
 def sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as file:
@@ -24,22 +19,22 @@ def media_kind(message) -> str | None:
     if getattr(message, "video", None):
         return "video"
 
-    document = getattr(message, "document", None)
-    mime_type = (getattr(document, "mime_type", "") or "").lower()
-
-    if mime_type.startswith(VIDEO_MIME_PREFIXES):
-        return "video"
-
-    if mime_type.startswith(PHOTO_MIME_PREFIXES):
-        return "photo"
-
     if getattr(message, "audio", None) or getattr(message, "voice", None):
         return "audio"
 
-    if mime_type.startswith(AUDIO_MIME_PREFIXES):
+    document = getattr(message, "document", None)
+    if document is None:
+        return None
+
+    mime_type = (getattr(document, "mime_type", "") or "").lower()
+
+    if mime_type.startswith("video/"):
+        return "video"
+
+    if mime_type.startswith("image/"):
+        return "photo"
+
+    if mime_type.startswith("audio/"):
         return "audio"
 
-    if document is not None:
-        return "file"
-
-    return None
+    return "file"
