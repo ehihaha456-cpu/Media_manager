@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from datetime import datetime, timezone
 from collections import defaultdict
 from pathlib import Path
 from uuid import uuid4
@@ -19,6 +20,9 @@ log = logging.getLogger(__name__)
 POLL_SECONDS = 2
 INITIAL_RECENT_MESSAGES = 50
 NEW_MEDIA_GROUP_WINDOW = 3
+HISTORY_PAGE_SIZE = 100
+HISTORY_MEDIA_BATCH_SIZE = 10
+HISTORY_PROGRESS_EVERY = 100
 
 
 class MediaRuntime:
@@ -44,6 +48,7 @@ class MediaRuntime:
 
         self.pending_notifications: dict[str, dict] = {}
         self.notification_tasks: dict[str, asyncio.Task] = {}
+        self.source_history_tasks: dict[int, asyncio.Task] = {}
 
     async def start(self) -> None:
         settings = await self.db.get_settings()
@@ -111,8 +116,26 @@ class MediaRuntime:
             settings["database_chat_id"],
         )
 
+        selected_sources = {
+            int(chat_id)
+            for chat_id in settings["source_chat_ids"]
+        }
+        for scan in await self.db.pending_source_history_scans():
+            chat_id = int(scan["chat_id"])
+            if chat_id in selected_sources:
+                self._start_source_history_task(chat_id)
+
     async def stop(self) -> None:
         self.running = False
+
+        for task in self.source_history_tasks.values():
+            task.cancel()
+        if self.source_history_tasks:
+            await asyncio.gather(
+                *self.source_history_tasks.values(),
+                return_exceptions=True,
+            )
+        self.source_history_tasks.clear()
 
         if self.poll_task:
             self.poll_task.cancel()
@@ -148,6 +171,414 @@ class MediaRuntime:
         if settings["service_enabled"]:
             await self.start()
 
+
+    async def register_source_history_scan(
+        self,
+        chat_id: int,
+    ) -> None:
+        chat_id = int(chat_id)
+        existing = await self.db.get_source_history_scan(chat_id)
+
+        if existing and existing.get("status") in {
+            "pending_count",
+            "counting",
+            "pending",
+            "scanning",
+            "completed",
+        }:
+            if (
+                self.running
+                and existing.get("status") != "completed"
+            ):
+                self._start_source_history_task(chat_id)
+            return
+
+        await self.db.upsert_source_history_scan(
+            chat_id,
+            status="pending_count",
+            cursor_message_id=0,
+            processed=0,
+            uploaded=0,
+            duplicates=0,
+            failed=0,
+            total_media=0,
+            videos=0,
+            photos=0,
+            audio=0,
+            files=0,
+        )
+
+        if self.running and self.client and self.client.is_connected():
+            self._start_source_history_task(chat_id)
+
+    async def remove_source_history_scan(
+        self,
+        chat_id: int,
+    ) -> None:
+        chat_id = int(chat_id)
+        task = self.source_history_tasks.pop(chat_id, None)
+        if task and not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+        await self.db.delete_source_history_scan(chat_id)
+
+    def _start_source_history_task(
+        self,
+        chat_id: int,
+    ) -> None:
+        chat_id = int(chat_id)
+        current = self.source_history_tasks.get(chat_id)
+
+        if current and not current.done():
+            return
+
+        task = asyncio.create_task(
+            self._run_source_history_scan(chat_id),
+            name=f"source-history-{chat_id}",
+        )
+        self.source_history_tasks[chat_id] = task
+
+        def cleanup(_task):
+            self.source_history_tasks.pop(chat_id, None)
+
+        task.add_done_callback(cleanup)
+
+    async def _count_source_history(
+        self,
+        chat_id: int,
+    ) -> dict:
+        counts = {
+            "video": 0,
+            "photo": 0,
+            "audio": 0,
+            "file": 0,
+        }
+
+        entity = await self.client.get_entity(chat_id)
+        chat_name = (
+            getattr(entity, "title", None)
+            or getattr(entity, "username", None)
+            or str(chat_id)
+        )
+
+        await self.db.upsert_source_history_scan(
+            chat_id,
+            status="counting",
+            chat_name=chat_name,
+        )
+
+        async for message in self.client.iter_messages(
+            entity,
+            reverse=True,
+        ):
+            kind = media_kind(message)
+            if kind in counts:
+                counts[kind] += 1
+
+        total_media = sum(counts.values())
+
+        await self.db.upsert_source_history_scan(
+            chat_id,
+            status="pending",
+            chat_name=chat_name,
+            total_media=total_media,
+            videos=counts["video"],
+            photos=counts["photo"],
+            audio=counts["audio"],
+            files=counts["file"],
+        )
+
+        media_lines = []
+        if counts["video"]:
+            media_lines.append(
+                f"🎬 Videos: <b>{counts['video']}</b>"
+            )
+        if counts["photo"]:
+            media_lines.append(
+                f"🖼 Images: <b>{counts['photo']}</b>"
+            )
+        if counts["audio"]:
+            media_lines.append(
+                f"🎵 Audio: <b>{counts['audio']}</b>"
+            )
+        if counts["file"]:
+            media_lines.append(
+                f"📁 Files: <b>{counts['file']}</b>"
+            )
+
+        await self.alert_bot.send_message(
+            chat_id=self.owner_id,
+            text=(
+                "✅ <b>New Source Group Detected</b>\n\n"
+                f"Source: <b>{chat_name}</b>\n"
+                f"Chat ID: <code>{chat_id}</code>\n\n"
+                + ("\n".join(media_lines) or "No media found")
+                + f"\n\nTotal: <b>{total_media}</b>\n\n"
+                "Status: Full history processing started.\n"
+                "Order: Oldest → Newest"
+            ),
+            parse_mode="HTML",
+        )
+
+        return {
+            "chat_name": chat_name,
+            "total_media": total_media,
+            **counts,
+        }
+
+    def _history_media_batches(
+        self,
+        messages: list,
+    ) -> list[list]:
+        batches: list[list] = []
+        current: list = []
+        current_grouped_id = None
+
+        for message in messages:
+            if not media_kind(message):
+                continue
+
+            grouped_id = getattr(message, "grouped_id", None)
+
+            if (
+                current
+                and len(current) >= HISTORY_MEDIA_BATCH_SIZE
+                and (
+                    grouped_id is None
+                    or grouped_id != current_grouped_id
+                )
+            ):
+                batches.append(current)
+                current = []
+
+            current.append(message)
+            current_grouped_id = grouped_id
+
+        if current:
+            batches.append(current)
+
+        return batches
+
+    async def _run_source_history_scan(
+        self,
+        chat_id: int,
+    ) -> None:
+        if not self.client or not self.client.is_connected():
+            return
+
+        try:
+            scan = await self.db.get_source_history_scan(chat_id)
+            if not scan:
+                return
+
+            if scan.get("status") in {
+                "pending_count",
+                "counting",
+            }:
+                await self._count_source_history(chat_id)
+                scan = await self.db.get_source_history_scan(chat_id)
+                if not scan:
+                    return
+
+            chat_name = scan.get("chat_name", str(chat_id))
+            total_media = int(scan.get("total_media", 0))
+            cursor = int(scan.get("cursor_message_id", 0))
+            processed = int(scan.get("processed", 0))
+            uploaded = int(scan.get("uploaded", 0))
+            duplicates = int(scan.get("duplicates", 0))
+            failed = int(scan.get("failed", 0))
+
+            await self.db.upsert_source_history_scan(
+                chat_id,
+                status="scanning",
+            )
+
+            entity = await self.client.get_entity(chat_id)
+
+            while self.running:
+                page = await self.client.get_messages(
+                    entity,
+                    min_id=cursor,
+                    limit=HISTORY_PAGE_SIZE,
+                    reverse=True,
+                )
+                page = list(page)
+
+                if not page:
+                    break
+
+                page.sort(key=lambda message: int(message.id))
+
+                for batch in self._history_media_batches(page):
+                    notification_key = (
+                        await self._register_media_batch(
+                            chat_id,
+                            batch,
+                        )
+                    )
+
+                    for message in batch:
+                        message_id = int(message.id)
+                        kind = media_kind(message)
+
+                        try:
+                            before_bucket = (
+                                self.pending_notifications.get(
+                                    notification_key,
+                                    {},
+                                )
+                            )
+                            before_uploaded = int(
+                                before_bucket.get("uploaded", 0)
+                            )
+                            before_duplicates = int(
+                                before_bucket.get("duplicate", 0)
+                            )
+
+                            result = await self._process_source_message(
+                                chat_id,
+                                message,
+                                kind,
+                                notification_key=notification_key,
+                            )
+
+                            if result is False:
+                                raise RuntimeError(
+                                    "Source media processing did not complete"
+                                )
+
+                            processed += 1
+
+                            after_bucket = (
+                                self.pending_notifications.get(
+                                    notification_key,
+                                    {},
+                                )
+                            )
+                            uploaded += max(
+                                0,
+                                int(after_bucket.get("uploaded", 0))
+                                - before_uploaded,
+                            )
+                            duplicates += max(
+                                0,
+                                int(after_bucket.get("duplicate", 0))
+                                - before_duplicates,
+                            )
+
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception as exc:
+                            failed += 1
+                            source_link = await self._message_link(
+                                chat_id,
+                                message_id,
+                            )
+                            await self._update_notification_result(
+                                notification_key,
+                                failed=1,
+                                failed_item={
+                                    "message_id": message_id,
+                                    "kind": kind or "unknown",
+                                    "reason": (
+                                        f"{type(exc).__name__}: {str(exc)}"
+                                    )[:300],
+                                    "link": source_link,
+                                },
+                            )
+                            log.exception(
+                                "Full-history media failed: "
+                                "chat=%s message=%s",
+                                chat_id,
+                                message_id,
+                            )
+
+                        cursor = message_id
+                        await self.db.upsert_source_history_scan(
+                            chat_id,
+                            status="scanning",
+                            cursor_message_id=cursor,
+                            processed=processed,
+                            uploaded=uploaded,
+                            duplicates=duplicates,
+                            failed=failed,
+                        )
+
+                        if (
+                            processed > 0
+                            and processed % HISTORY_PROGRESS_EVERY == 0
+                        ):
+                            await self.alert_bot.send_message(
+                                chat_id=self.owner_id,
+                                text=(
+                                    "⏳ <b>Source History Progress</b>\n\n"
+                                    f"Source: <b>{chat_name}</b>\n"
+                                    f"Processed: <b>{processed} / "
+                                    f"{total_media}</b>\n"
+                                    f"Uploaded: <b>{uploaded}</b>\n"
+                                    f"Duplicates: <b>{duplicates}</b>\n"
+                                    f"Failed: <b>{failed}</b>\n\n"
+                                    "Status: Oldest → Newest"
+                                ),
+                                parse_mode="HTML",
+                            )
+
+                cursor = max(
+                    cursor,
+                    max(int(message.id) for message in page),
+                )
+                await self.db.upsert_source_history_scan(
+                    chat_id,
+                    cursor_message_id=cursor,
+                )
+
+                if len(page) < HISTORY_PAGE_SIZE:
+                    break
+
+            await self.db.set_chat_offset(chat_id, cursor)
+            await self.db.upsert_source_history_scan(
+                chat_id,
+                status="completed",
+                cursor_message_id=cursor,
+                processed=processed,
+                uploaded=uploaded,
+                duplicates=duplicates,
+                failed=failed,
+                completed_at=datetime.now(timezone.utc),
+            )
+
+            await self.alert_bot.send_message(
+                chat_id=self.owner_id,
+                text=(
+                    "✅ <b>Source History Completed</b>\n\n"
+                    f"Source: <b>{chat_name}</b>\n"
+                    f"Processed: <b>{processed}</b>\n"
+                    f"Uploaded to Database: <b>{uploaded}</b>\n"
+                    f"Duplicates: <b>{duplicates}</b>\n"
+                    f"Failed: <b>{failed}</b>\n\n"
+                    "Live monitoring is now active."
+                ),
+                parse_mode="HTML",
+            )
+
+        except asyncio.CancelledError:
+            await self.db.upsert_source_history_scan(
+                chat_id,
+                status="pending",
+            )
+            raise
+        except Exception as exc:
+            await self.db.upsert_source_history_scan(
+                chat_id,
+                status="pending",
+                last_error=str(exc)[:1000],
+            )
+            log.exception(
+                "Full source history scan failed: chat=%s",
+                chat_id,
+            )
+
     async def _poll_loop(self) -> None:
         while self.running:
             try:
@@ -170,6 +601,19 @@ class MediaRuntime:
             source_chat_id = int(source_chat_id)
             if source_chat_id == database_chat_id:
                 continue
+
+            scan = await self.db.get_source_history_scan(
+                source_chat_id
+            )
+            if scan and scan.get("status") in {
+                "pending_count",
+                "counting",
+                "pending",
+                "scanning",
+            }:
+                self._start_source_history_task(source_chat_id)
+                continue
+
             await self._poll_source_chat(source_chat_id)
 
         await self._poll_database_chat(database_chat_id)

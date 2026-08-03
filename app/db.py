@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timezone, timedelta
 from typing import Any
 
 from pymongo import ASCENDING, AsyncMongoClient, ReturnDocument
 from pymongo.errors import DuplicateKeyError
+
+log = logging.getLogger(__name__)
 
 
 def now() -> datetime:
@@ -46,6 +49,7 @@ class Database:
         self.counters = self.database["counters"]
         self.chat_offsets = self.database["chat_offsets"]
         self.activity_stats = self.database["activity_stats"]
+        self.source_history_scans = self.database["source_history_scans"]
 
     async def initialize(self) -> None:
         await self.client.admin.command("ping")
@@ -127,6 +131,68 @@ class Database:
                 }
             },
             upsert=True,
+        )
+
+
+    async def get_source_history_scan(
+        self,
+        chat_id: int,
+    ) -> dict | None:
+        document = await self.source_history_scans.find_one(
+            {"_id": str(int(chat_id))}
+        )
+        return dict(document) if document else None
+
+    async def upsert_source_history_scan(
+        self,
+        chat_id: int,
+        **values,
+    ) -> None:
+        values["chat_id"] = int(chat_id)
+        values["updated_at"] = now()
+
+        await self.source_history_scans.update_one(
+            {"_id": str(int(chat_id))},
+            {
+                "$set": values,
+                "$setOnInsert": {
+                    "created_at": now(),
+                    "cursor_message_id": 0,
+                    "processed": 0,
+                    "uploaded": 0,
+                    "duplicates": 0,
+                    "failed": 0,
+                    "total_media": 0,
+                    "videos": 0,
+                    "photos": 0,
+                    "audio": 0,
+                    "files": 0,
+                },
+            },
+            upsert=True,
+        )
+
+    async def pending_source_history_scans(self) -> list[dict]:
+        cursor = self.source_history_scans.find(
+            {
+                "status": {
+                    "$in": [
+                        "pending_count",
+                        "counting",
+                        "pending",
+                        "scanning",
+                    ]
+                }
+            }
+        )
+        return [dict(document) async for document in cursor]
+
+    async def delete_source_history_scan(
+        self,
+        chat_id: int,
+    ) -> None:
+        await self.source_history_scans.delete_one(
+            {"_id": str(int(chat_id))}
         )
 
     async def find_by_hash(self, sha256: str) -> dict | None:

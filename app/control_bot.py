@@ -305,18 +305,37 @@ class ControlBot:
 
             if mode == "source":
                 selected = [int(x) for x in settings["source_chat_ids"]]
-                if chat_id in selected:
+                is_new_source = chat_id not in selected
+
+                if is_new_source:
+                    selected.append(chat_id)
+                    message = (
+                        "Source selected — full history scan queued"
+                    )
+                    await self.runtime.register_source_history_scan(
+                        chat_id
+                    )
+                else:
                     selected.remove(chat_id)
                     message = "Source removed"
-                else:
-                    selected.append(chat_id)
-                    message = "Source selected"
-                await self.db.update_settings(source_chat_ids=selected)
+                    await self.runtime.remove_source_history_scan(
+                        chat_id
+                    )
+
+                await self.db.update_settings(
+                    source_chat_ids=selected
+                )
+
                 updated = await self.db.get_settings()
                 if updated["service_enabled"]:
                     await self.runtime.restart()
+
                 await q.answer(message, show_alert=False)
-                return await self.show_chat_selector(update, context, "source")
+                return await self.show_chat_selector(
+                    update,
+                    context,
+                    "source",
+                )
 
             if mode == "destination":
                 selected = [int(x) for x in settings["destination_chat_ids"]]
