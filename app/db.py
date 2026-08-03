@@ -25,8 +25,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "copy_to_database": 1,
     "queue_for_publishing": 1,
     "publish_interval_minutes": 60,
-    "publish_batch_size": 3,
-    "performance_mode": "balanced",
+    "publish_batch_size": 1,
     "service_enabled": 0,
     "updated_at": None,
 }
@@ -48,28 +47,18 @@ class Database:
 
     async def initialize(self) -> None:
         await self.client.admin.command("ping")
-
         await self.settings.update_one(
             {"_id": "owner"},
-            {
-                "$setOnInsert": {
-                    **DEFAULT_SETTINGS,
-                    "updated_at": now(),
-                }
-            },
+            {"$setOnInsert": {**DEFAULT_SETTINGS, "updated_at": now()}},
             upsert=True,
         )
-
         await self.media.create_index(
             [("sha256", ASCENDING)],
             unique=True,
             name="unique_media_sha256",
         )
         await self.publish_queue.create_index(
-            [
-                ("media_id", ASCENDING),
-                ("destination_chat_id", ASCENDING),
-            ],
+            [("media_id", ASCENDING), ("destination_chat_id", ASCENDING)],
             unique=True,
             name="unique_media_destination",
         )
@@ -92,26 +81,19 @@ class Database:
 
     async def get_settings(self) -> dict:
         document = await self.settings.find_one({"_id": "owner"})
-        if document is None:
-            await self.initialize()
-            document = await self.settings.find_one({"_id": "owner"})
-
         result = dict(DEFAULT_SETTINGS)
         result.update(document or {})
         result["source_chat_ids"] = [
-            int(value)
-            for value in result.get("source_chat_ids", [])
+            int(x) for x in result.get("source_chat_ids", [])
         ]
         result["destination_chat_ids"] = [
-            int(value)
-            for value in result.get("destination_chat_ids", [])
+            int(x) for x in result.get("destination_chat_ids", [])
         ]
         return result
 
     async def update_settings(self, **values) -> None:
         if not values:
             return
-
         values["updated_at"] = now()
         await self.settings.update_one(
             {"_id": "owner"},
@@ -123,88 +105,50 @@ class Database:
         document = await self.media.find_one({"sha256": sha256})
         return dict(document) if document else None
 
-
-async def register_media(
-    self,
-    sha256: str,
-    kind: str,
-    size: int,
-    chat_id: int,
-    message_id: int,
-    caption: str | None,
-) -> tuple[bool, dict]:
-    media_id = await self._next_id("media")
-    document = {
-        "_id": media_id,
-        "id": media_id,
-        "sha256": sha256,
-        "media_kind": kind,
-        "size_bytes": int(size),
-        "source_chat_id": int(chat_id),
-        "source_message_id": int(message_id),
-        "database_chat_id": int(chat_id),
-        "database_message_id": int(message_id),
-        "caption": caption,
-        "created_at": now(),
-    }
-
-    try:
-        await self.media.insert_one(document)
-        return True, document
-    except DuplicateKeyError:
-        existing = await self.media.find_one({"sha256": sha256})
-        if existing is None:
-            raise
-        return False, dict(existing)
-
-    async def add_media(
+    async def register_database_media(
         self,
+        *,
         sha256: str,
         kind: str,
         size: int,
-        chat_id: int,
-        message_id: int,
+        database_chat_id: int,
+        database_message_id: int,
         caption: str | None,
-    ) -> int:
+        source_chat_id: int | None = None,
+        source_message_id: int | None = None,
+    ) -> tuple[bool, dict]:
         media_id = await self._next_id("media")
-        await self.media.insert_one(
-            {
-                "_id": media_id,
-                "id": media_id,
-                "sha256": sha256,
-                "media_kind": kind,
-                "size_bytes": int(size),
-                "source_chat_id": int(chat_id),
-                "source_message_id": int(message_id),
-                "database_chat_id": None,
-                "database_message_id": None,
-                "caption": caption,
-                "created_at": now(),
-            }
-        )
-        return media_id
+        document = {
+            "_id": media_id,
+            "id": media_id,
+            "sha256": sha256,
+            "media_kind": kind,
+            "size_bytes": int(size),
+            "source_chat_id": int(
+                source_chat_id
+                if source_chat_id is not None
+                else database_chat_id
+            ),
+            "source_message_id": int(
+                source_message_id
+                if source_message_id is not None
+                else database_message_id
+            ),
+            "database_chat_id": int(database_chat_id),
+            "database_message_id": int(database_message_id),
+            "caption": caption,
+            "created_at": now(),
+        }
+        try:
+            await self.media.insert_one(document)
+            return True, document
+        except DuplicateKeyError:
+            existing = await self.media.find_one({"sha256": sha256})
+            if existing is None:
+                raise
+            return False, dict(existing)
 
-    async def set_database_message(
-        self,
-        media_id: int,
-        chat_id: int,
-        message_id: int,
-    ) -> None:
-        await self.media.update_one(
-            {"_id": int(media_id)},
-            {
-                "$set": {
-                    "database_chat_id": int(chat_id),
-                    "database_message_id": int(message_id),
-                }
-            },
-        )
-
-    async def enqueue(
-        self,
-        media_id: int,
-        destination_chat_id: int,
-    ) -> None:
+    async def enqueue(self, media_id: int, destination_chat_id: int) -> None:
         existing = await self.publish_queue.find_one(
             {
                 "media_id": int(media_id),
@@ -230,59 +174,33 @@ async def register_media(
                     "published_at": None,
                 }
             )
-        except Exception:
-            # A simultaneous duplicate insert can safely be ignored.
-            existing = await self.publish_queue.find_one(
-                {
-                    "media_id": int(media_id),
-                    "destination_chat_id": int(destination_chat_id),
-                },
-                {"_id": 1},
-            )
-            if not existing:
-                raise
+        except DuplicateKeyError:
+            return
 
     async def pending(self, limit: int) -> list[dict]:
+        rows: list[dict] = []
         cursor = (
             self.publish_queue.find({"status": "pending"})
             .sort("id", ASCENDING)
             .limit(int(limit))
         )
-
-        rows: list[dict] = []
         async for queue in cursor:
             media = await self.media.find_one(
                 {"_id": int(queue["media_id"])}
             )
             if not media:
-                await self.publish_queue.update_one(
-                    {"_id": queue["_id"]},
-                    {
-                        "$set": {
-                            "status": "failed",
-                            "last_error": "Media record not found",
-                        }
-                    },
-                )
                 continue
-
             rows.append(
                 {
                     "queue_id": int(queue["id"]),
                     "destination_chat_id": int(
                         queue["destination_chat_id"]
                     ),
-                    "source_chat_id": int(
-                        media["source_chat_id"]
-                    ),
-                    "source_message_id": int(
-                        media["source_message_id"]
-                    ),
-                    "database_chat_id": media.get(
-                        "database_chat_id"
-                    ),
-                    "database_message_id": media.get(
-                        "database_message_id"
+                    "source_chat_id": int(media["source_chat_id"]),
+                    "source_message_id": int(media["source_message_id"]),
+                    "database_chat_id": int(media["database_chat_id"]),
+                    "database_message_id": int(
+                        media["database_message_id"]
                     ),
                     "caption": media.get("caption"),
                 }
