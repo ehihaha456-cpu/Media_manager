@@ -11,6 +11,11 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from telegram import Bot
 from telethon import TelegramClient
 from telethon.sessions import StringSession
+from telethon.tl.types import (
+    DocumentAttributeAudio,
+    DocumentAttributeFilename,
+    DocumentAttributeVideo,
+)
 
 from .crypto import decrypt_text
 from .media import media_kind, sha256_file
@@ -1102,6 +1107,160 @@ class MediaRuntime:
                     )
                     return
 
+    @staticmethod
+    def _document_attributes(message, kind: str) -> tuple[list, str | None]:
+        document = getattr(message, "document", None)
+        mime_type = getattr(document, "mime_type", None) if document else None
+        source_attributes = list(getattr(document, "attributes", []) or [])
+        attributes: list = []
+
+        filename = None
+        for attribute in source_attributes:
+            if isinstance(attribute, DocumentAttributeFilename):
+                filename = attribute.file_name
+                break
+
+        if not filename:
+            file_obj = getattr(message, "file", None)
+            filename = getattr(file_obj, "name", None)
+
+        if filename:
+            attributes.append(DocumentAttributeFilename(str(filename)))
+
+        if kind == "video":
+            video_attribute = next(
+                (
+                    attribute
+                    for attribute in source_attributes
+                    if isinstance(attribute, DocumentAttributeVideo)
+                ),
+                None,
+            )
+            if video_attribute:
+                attributes.append(
+                    DocumentAttributeVideo(
+                        duration=max(0.0, float(video_attribute.duration or 0)),
+                        w=max(0, int(video_attribute.w or 0)),
+                        h=max(0, int(video_attribute.h or 0)),
+                        round_message=bool(
+                            getattr(video_attribute, "round_message", False)
+                        ),
+                        supports_streaming=True,
+                        nosound=bool(
+                            getattr(video_attribute, "nosound", False)
+                        ),
+                    )
+                )
+
+        elif kind == "audio":
+            audio_attribute = next(
+                (
+                    attribute
+                    for attribute in source_attributes
+                    if isinstance(attribute, DocumentAttributeAudio)
+                ),
+                None,
+            )
+            if audio_attribute:
+                attributes.append(
+                    DocumentAttributeAudio(
+                        duration=max(0, int(audio_attribute.duration or 0)),
+                        voice=bool(getattr(audio_attribute, "voice", False)),
+                        title=getattr(audio_attribute, "title", None),
+                        performer=getattr(audio_attribute, "performer", None),
+                        waveform=getattr(audio_attribute, "waveform", None),
+                    )
+                )
+
+        return attributes, mime_type
+
+    async def _download_media_thumbnail(
+        self,
+        message,
+        base_path: Path,
+    ) -> Path | None:
+        document = getattr(message, "document", None)
+        thumbs = list(getattr(document, "thumbs", []) or []) if document else []
+        if not thumbs:
+            return None
+
+        thumb_base = Path(str(base_path) + "_thumb.jpg")
+        try:
+            downloaded = await message.download_media(
+                file=str(thumb_base),
+                thumb=-1,
+            )
+            if not downloaded:
+                return None
+            path = Path(downloaded)
+            return path if path.exists() and path.stat().st_size > 0 else None
+        except Exception:
+            log.exception(
+                "Could not preserve media thumbnail: chat=%s message=%s",
+                getattr(message, "chat_id", None),
+                getattr(message, "id", None),
+            )
+            return None
+
+    async def _resolve_peer(self, chat_id: int):
+        if not self.client:
+            raise RuntimeError("Telegram client is not connected")
+
+        try:
+            return await self.client.get_input_entity(int(chat_id))
+        except Exception:
+            # Refresh dialogs once so recently joined private groups/channels
+            # become available in Telethon's entity cache.
+            async for _ in self.client.iter_dialogs(limit=None):
+                pass
+            return await self.client.get_input_entity(int(chat_id))
+
+    async def _upload_downloaded_media(
+        self,
+        target_chat_id: int,
+        path: Path,
+        source_message,
+        kind: str,
+        caption: str | None,
+    ):
+        if not self.client:
+            raise RuntimeError("Telegram client is not connected")
+
+        target = await self._resolve_peer(target_chat_id)
+        attributes, mime_type = self._document_attributes(
+            source_message,
+            kind,
+        )
+        thumb_path: Path | None = None
+
+        try:
+            if kind == "video":
+                thumb_path = await self._download_media_thumbnail(
+                    source_message,
+                    path,
+                )
+
+            kwargs = {
+                "caption": caption,
+                "supports_streaming": kind == "video",
+                "force_document": kind == "file",
+            }
+            if attributes:
+                kwargs["attributes"] = attributes
+            if mime_type:
+                kwargs["mime_type"] = mime_type
+            if thumb_path:
+                kwargs["thumb"] = thumb_path
+
+            return await self.client.send_file(
+                target,
+                path,
+                **kwargs,
+            )
+        finally:
+            if thumb_path:
+                thumb_path.unlink(missing_ok=True)
+
     async def _process_source_message(
         self,
         source_chat_id: int,
@@ -1130,11 +1289,12 @@ class MediaRuntime:
                 path = Path(downloaded)
                 digest = await asyncio.to_thread(sha256_file, path)
 
-                sent = await self.client.send_file(
+                sent = await self._upload_downloaded_media(
                     database_chat_id,
                     path,
-                    caption=message.message or None,
-                    supports_streaming=(kind == "video"),
+                    message,
+                    kind,
+                    message.message or None,
                 )
 
                 inserted, record = await self.db.register_database_media(
@@ -1943,8 +2103,11 @@ class MediaRuntime:
 
                 kind = media_kind(message)
                 try:
+                    destination_peer = await self._resolve_peer(
+                        destination_id
+                    )
                     await self.client.send_file(
-                        destination_id,
+                        destination_peer,
                         message.media,
                         caption=row.get("caption") or None,
                         supports_streaming=(kind == "video"),
@@ -1955,11 +2118,12 @@ class MediaRuntime:
                     if not downloaded:
                         raise RuntimeError("Media download fallback returned no file")
                     temp_path = Path(downloaded)
-                    await self.client.send_file(
+                    await self._upload_downloaded_media(
                         destination_id,
                         temp_path,
-                        caption=row.get("caption") or None,
-                        supports_streaming=(kind == "video"),
+                        message,
+                        kind,
+                        row.get("caption") or None,
                     )
 
                 await self.db.mark_published(queue_id)
