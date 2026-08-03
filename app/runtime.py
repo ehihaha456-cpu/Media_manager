@@ -324,9 +324,27 @@ class MediaRuntime:
                         original_chat_id == int(database_chat_id)
                         and original_message_id == int(message.id)
                     ):
+                        current_link = await self._message_link(
+                            database_chat_id,
+                            int(message.id),
+                        )
+                        file_index = self.pending_notifications[
+                            notification_key
+                        ]["file_results"][int(message.id)]["index"]
                         await self._update_notification_result(
                             notification_key,
                             processed=1,
+                            processed_pair={
+                                "index": file_index,
+                                "source_link": current_link,
+                                "database_link": current_link,
+                            },
+                            file_result={
+                                "message_id": int(message.id),
+                                "status": "processed",
+                                "source_link": current_link,
+                                "database_link": current_link,
+                            },
                         )
                         return
     
@@ -386,11 +404,29 @@ class MediaRuntime:
                                 )
                                 queued += 1
     
+                        current_link = await self._message_link(
+                            database_chat_id,
+                            int(message.id),
+                        )
+                        file_index = self.pending_notifications[
+                            notification_key
+                        ]["file_results"][int(message.id)]["index"]
                         await self._update_notification_result(
                             notification_key,
                             uploaded=1,
                             queued=queued,
                             processed=1,
+                            processed_pair={
+                                "index": file_index,
+                                "source_link": current_link,
+                                "database_link": current_link,
+                            },
+                            file_result={
+                                "message_id": int(message.id),
+                                "status": "processed",
+                                "source_link": current_link,
+                                "database_link": current_link,
+                            },
                         )
                         return
     
@@ -453,11 +489,29 @@ class MediaRuntime:
                         )
                         queued += 1
     
+                current_link = await self._message_link(
+                    database_chat_id,
+                    int(message.id),
+                )
+                file_index = self.pending_notifications[
+                    notification_key
+                ]["file_results"][int(message.id)]["index"]
                 await self._update_notification_result(
                     notification_key,
                     uploaded=1,
                     queued=queued,
                     processed=1,
+                    processed_pair={
+                        "index": file_index,
+                        "source_link": current_link,
+                        "database_link": current_link,
+                    },
+                    file_result={
+                        "message_id": int(message.id),
+                        "status": "processed",
+                        "source_link": current_link,
+                        "database_link": current_link,
+                    },
                 )
             finally:
                 Path(temp).unlink(missing_ok=True)
@@ -705,11 +759,34 @@ class MediaRuntime:
                                     destination_id,
                                 )
 
+                        source_link = await self._message_link(
+                            source_chat_id,
+                            int(message.id),
+                        )
+                        database_link = await self._message_link(
+                            database_chat_id,
+                            int(sent.id),
+                        )
+                        file_index = self.pending_notifications[
+                            notification_key
+                        ]["file_results"][int(message.id)]["index"]
+
                         await self._update_notification_result(
                             notification_key,
                             uploaded=1,
                             queued=1,
                             processed=1,
+                            processed_pair={
+                                "index": file_index,
+                                "source_link": source_link,
+                                "database_link": database_link,
+                            },
+                            file_result={
+                                "message_id": int(message.id),
+                                "status": "processed",
+                                "source_link": source_link,
+                                "database_link": database_link,
+                            },
                         )
 
                         log.info(
@@ -746,17 +823,27 @@ class MediaRuntime:
                                 "Duplicate Database copy could not be deleted"
                             )
 
+                    file_index = self.pending_notifications[
+                        notification_key
+                    ]["file_results"][int(message.id)]["index"]
+
                     await self._update_notification_result(
                         notification_key,
                         duplicate=1,
                         processed=1,
                         duplicate_pair={
+                            "index": file_index,
                             "original_link": original_link,
                             "duplicate_link": duplicate_link,
                             "original_chat_id": original_chat_id,
                             "original_message_id": original_message_id,
                             "duplicate_chat_id": source_chat_id,
                             "duplicate_message_id": int(message.id),
+                        },
+                        file_result={
+                            "message_id": int(message.id),
+                            "status": "duplicate",
+                            "source_link": duplicate_link,
                         },
                     )
                     return True
@@ -769,11 +856,34 @@ class MediaRuntime:
                             destination_id,
                         )
 
+                source_link = await self._message_link(
+                    source_chat_id,
+                    int(message.id),
+                )
+                database_link = await self._message_link(
+                    database_chat_id,
+                    int(sent.id),
+                )
+                file_index = self.pending_notifications[
+                    notification_key
+                ]["file_results"][int(message.id)]["index"]
+
                 await self._update_notification_result(
                     notification_key,
                     uploaded=1,
                     queued=1,
                     processed=1,
+                    processed_pair={
+                        "index": file_index,
+                        "source_link": source_link,
+                        "database_link": database_link,
+                    },
+                    file_result={
+                        "message_id": int(message.id),
+                        "status": "processed",
+                        "source_link": source_link,
+                        "database_link": database_link,
+                    },
                 )
 
                 log.info(
@@ -833,6 +943,22 @@ class MediaRuntime:
             if kind:
                 counts[kind] += 1
 
+        file_results = {}
+        for index, message in enumerate(messages, start=1):
+            message_id = int(message.id)
+            file_results[message_id] = {
+                "index": index,
+                "message_id": message_id,
+                "kind": media_kind(message) or "file",
+                "status": "processing",
+                "source_link": await self._message_link(
+                    int(source_chat_id),
+                    message_id,
+                ),
+                "database_link": None,
+                "reason": None,
+            }
+
         bucket = {
             "source_chat_id": int(source_chat_id),
             "counts": counts,
@@ -840,10 +966,12 @@ class MediaRuntime:
             "processed": 0,
             "uploaded": 0,
             "duplicate": 0,
+            "processed_pairs": [],
             "duplicate_pairs": [],
             "queued": 0,
             "failed": 0,
             "failed_items": [],
+            "file_results": file_results,
             "message_id": None,
             "chat_name": None,
         }
@@ -863,7 +991,9 @@ class MediaRuntime:
         queued: int = 0,
         failed: int = 0,
         failed_item: dict | None = None,
+        processed_pair: dict | None = None,
         duplicate_pair: dict | None = None,
+        file_result: dict | None = None,
     ) -> None:
         bucket = self.pending_notifications.get(key)
         if not bucket:
@@ -879,11 +1009,36 @@ class MediaRuntime:
             bucket.setdefault("failed_items", []).append(
                 dict(failed_item)
             )
+            message_id = int(failed_item.get("message_id", 0))
+            item = bucket.get("file_results", {}).get(message_id)
+            if item:
+                item["status"] = "failed"
+                item["reason"] = failed_item.get("reason")
+                if failed_item.get("link"):
+                    item["source_link"] = failed_item.get("link")
+
+        if processed_pair:
+            bucket.setdefault("processed_pairs", []).append(
+                dict(processed_pair)
+            )
 
         if duplicate_pair:
             bucket.setdefault("duplicate_pairs", []).append(
                 dict(duplicate_pair)
             )
+
+        if file_result:
+            message_id = int(file_result.get("message_id", 0))
+            item = bucket.get("file_results", {}).get(message_id)
+            if item:
+                item.update(dict(file_result))
+
+        if (
+            bucket["message_id"] is not None
+            and bucket["processed"] + bucket["failed"]
+            < bucket["expected"]
+        ):
+            await self._refresh_processing_notification(key)
 
         # If the initial message has already been sent and all detected media
         # finished processing, edit that same message immediately.
@@ -975,6 +1130,41 @@ class MediaRuntime:
 
         return lines
 
+    def _file_link_text(
+        self,
+        link: str | None,
+        label: str,
+    ) -> str:
+        if link:
+            return f'<a href="{link}">{label}</a>'
+        return label
+
+    def _processing_file_lines(self, bucket: dict) -> list[str]:
+        lines: list[str] = []
+        items = sorted(
+            bucket.get("file_results", {}).values(),
+            key=lambda item: int(item.get("index", 0)),
+        )
+
+        for item in items:
+            index = int(item.get("index", 0))
+            source_text = self._file_link_text(
+                item.get("source_link"),
+                "📂 Original File",
+            )
+            status = item.get("status", "processing")
+            icon = {
+                "processed": "✅",
+                "duplicate": "✅",
+                "failed": "❌",
+                "processing": "⏳",
+            }.get(status, "⏳")
+            lines.append(
+                f"File {index}: {source_text} {icon}"
+            )
+
+        return lines
+
     async def _send_processing_notification(
         self,
         key: str,
@@ -1000,7 +1190,9 @@ class MediaRuntime:
             f"Chat ID: <code>{source_chat_id}</code>\n\n"
             + "\n".join(lines)
             + f"\n\nTotal: <b>{total}</b>\n\n"
-            "⏳ <b>Processing...</b>"
+            "📂 <b>Processing Files</b>\n"
+            + "\n".join(self._processing_file_lines(bucket))
+            + "\n\n⏳ <b>Processing...</b>"
         )
 
         sent = await self.alert_bot.send_message(
@@ -1009,6 +1201,48 @@ class MediaRuntime:
             parse_mode="HTML",
         )
         bucket["message_id"] = int(sent.message_id)
+
+    async def _refresh_processing_notification(
+        self,
+        key: str,
+    ) -> None:
+        bucket = self.pending_notifications.get(key)
+        if not bucket or bucket.get("message_id") is None:
+            return
+
+        source_chat_id = int(bucket["source_chat_id"])
+        chat_name = (
+            bucket.get("chat_name")
+            or await self._resolve_chat_name(source_chat_id)
+        )
+        lines = self._media_count_lines(bucket["counts"])
+        total = sum(bucket["counts"].values())
+
+        text = (
+            "🆕 <b>New Media Detected</b>\n\n"
+            f"Source: <b>{chat_name}</b>\n"
+            f"Chat ID: <code>{source_chat_id}</code>\n\n"
+            + "\n".join(lines)
+            + f"\n\nTotal: <b>{total}</b>\n\n"
+            "📂 <b>Processing Files</b>\n"
+            + "\n".join(self._processing_file_lines(bucket))
+            + "\n\n⏳ <b>Processing...</b>"
+        )
+
+        try:
+            await self.alert_bot.edit_message_text(
+                chat_id=self.owner_id,
+                message_id=int(bucket["message_id"]),
+                text=text,
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+            )
+        except Exception as exc:
+            if "Message is not modified" not in str(exc):
+                log.exception(
+                    "Could not refresh processing notification: key=%s",
+                    key,
+                )
 
     async def _finalize_notification(
         self,
@@ -1048,6 +1282,35 @@ class MediaRuntime:
             f"Destination Queue: <b>{bucket['queued']}</b>"
         )
 
+        processed_pairs = bucket.get(
+            "processed_pairs",
+            [],
+        )
+
+        if processed_pairs:
+            final_text += "\n\n📂 <b>Processed Files</b>"
+
+            for pair in processed_pairs[:20]:
+                index = int(pair.get("index", 0))
+                source_text = self._file_link_text(
+                    pair.get("source_link"),
+                    "📂 Source Media",
+                )
+                database_text = self._file_link_text(
+                    pair.get("database_link"),
+                    "🗄 Database Media",
+                )
+                final_text += (
+                    f"\nFile {index}: "
+                    f"{source_text}    {database_text} ✅"
+                )
+
+            if len(processed_pairs) > 20:
+                final_text += (
+                    f"\n+{len(processed_pairs) - 20} "
+                    "more processed files"
+                )
+
         duplicate_pairs = bucket.get(
             "duplicate_pairs",
             [],
@@ -1058,10 +1321,13 @@ class MediaRuntime:
                 "\n\n📂 <b>Duplicate Files</b>"
             )
 
-            for index, pair in enumerate(
+            for fallback_index, pair in enumerate(
                 duplicate_pairs[:20],
                 start=1,
             ):
+                index = int(
+                    pair.get("index", fallback_index)
+                )
                 original_link = pair.get("original_link")
                 duplicate_link = pair.get("duplicate_link")
 
@@ -1083,7 +1349,7 @@ class MediaRuntime:
                 )
 
                 final_text += (
-                    f"\nFiles {index}: "
+                    f"\nFile {index}: "
                     f"{original_text}    {duplicate_text}"
                 )
 
@@ -1151,6 +1417,7 @@ class MediaRuntime:
                 message_id=int(bucket["message_id"]),
                 text=final_text,
                 parse_mode="HTML",
+                disable_web_page_preview=True,
             )
         except Exception:
             log.exception(
