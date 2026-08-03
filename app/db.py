@@ -89,6 +89,7 @@ class Database:
         current = now()
         expires_at = current + timedelta(seconds=lease_seconds)
 
+        # First, atomically renew our own lease or take over an expired one.
         document = await self.runtime_locks.find_one_and_update(
             {
                 "_id": lock_id,
@@ -103,13 +104,29 @@ class Database:
                     "owner_id": owner_id,
                     "expires_at": expires_at,
                     "updated_at": current,
-                },
-                "$setOnInsert": {"created_at": current},
+                }
             },
-            upsert=True,
+            upsert=False,
             return_document=ReturnDocument.AFTER,
         )
-        return bool(document and document.get("owner_id") == owner_id)
+        if document and document.get("owner_id") == owner_id:
+            return True
+
+        # If the lock does not exist, create it. Two deployments may race
+        # here; only one insert can win because _id is unique.
+        try:
+            await self.runtime_locks.insert_one(
+                {
+                    "_id": lock_id,
+                    "owner_id": owner_id,
+                    "expires_at": expires_at,
+                    "created_at": current,
+                    "updated_at": current,
+                }
+            )
+            return True
+        except DuplicateKeyError:
+            return False
 
     async def renew_runtime_lock(
         self,
