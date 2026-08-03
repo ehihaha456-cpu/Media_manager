@@ -160,7 +160,11 @@ class MediaRuntime:
         for source_chat_id in settings["source_chat_ids"]:
             await self._poll_source_chat(int(source_chat_id))
 
-    async def _poll_source_chat(self, chat_id: int) -> None:
+
+    async def _poll_source_chat(
+        self,
+        chat_id: int,
+    ) -> None:
         offset = await self.db.get_chat_offset(chat_id)
 
         if offset is None:
@@ -180,40 +184,116 @@ class MediaRuntime:
                 reverse=True,
             )
 
+        # Group Telegram albums by grouped_id. Non-album media arriving in
+        # the same polling cycle are grouped into one burst notification.
+        batches: list[list] = []
+        album_map: dict[int, list] = {}
+        single_batch: list = []
+
         for message in messages:
-            message_id = int(message.id)
             kind = media_kind(message)
 
             if not kind:
-                await self.db.set_chat_offset(chat_id, message_id)
+                # Flush pending non-album burst before committing text/service
+                # messages so ordering stays correct.
+                if single_batch:
+                    batches.append(single_batch)
+                    single_batch = []
+
+                grouped_id = getattr(message, "grouped_id", None)
+                if grouped_id and int(grouped_id) in album_map:
+                    batches.append(album_map.pop(int(grouped_id)))
+
+                await self.db.set_chat_offset(
+                    chat_id,
+                    int(message.id),
+                )
                 continue
 
-            try:
-                result = await self._process_source_message(
-                    chat_id,
-                    message,
-                    kind,
-                )
+            grouped_id = getattr(message, "grouped_id", None)
 
-                if result is False:
-                    break
+            if grouped_id:
+                album_map.setdefault(
+                    int(grouped_id),
+                    [],
+                ).append(message)
+            else:
+                single_batch.append(message)
 
-                await self.db.set_chat_offset(chat_id, message_id)
+        if single_batch:
+            batches.append(single_batch)
 
-            except Exception:
-                log.exception(
-                    "Source media failed; retained for retry: "
-                    "chat=%s message=%s",
-                    chat_id,
-                    message_id,
-                )
-                break
+        batches.extend(album_map.values())
+
+        # Ensure oldest batch is processed first.
+        batches.sort(
+            key=lambda batch: min(
+                int(item.id) for item in batch
+            )
+        )
+
+        for batch in batches:
+            batch.sort(key=lambda item: int(item.id))
+
+            notification_key = await self._register_media_batch(
+                chat_id,
+                batch,
+            )
+
+            for message in batch:
+                message_id = int(message.id)
+                kind = media_kind(message)
+
+                try:
+                    result = await self._process_source_message(
+                        chat_id,
+                        message,
+                        kind,
+                        notification_key=notification_key,
+                    )
+
+                    if result is False:
+                        return
+
+                    await self.db.set_chat_offset(
+                        chat_id,
+                        message_id,
+                    )
+
+                except Exception as exc:
+                    source_link = await self._message_link(
+                        chat_id,
+                        message_id,
+                    )
+
+                    await self._update_notification_result(
+                        notification_key,
+                        failed=1,
+                        failed_item={
+                            "message_id": message_id,
+                            "kind": kind or "unknown",
+                            "reason": (
+                                f"{type(exc).__name__}: {str(exc)}"
+                            )[:300],
+                            "link": source_link,
+                        },
+                    )
+
+                    log.exception(
+                        "Source media failed; retained for retry: "
+                        "chat=%s message=%s",
+                        chat_id,
+                        message_id,
+                    )
+                    return
 
     async def _process_source_message(
         self,
         source_chat_id: int,
         message,
         kind: str,
+        *,
+        notification_key: str,
     ) -> bool:
         if not self.client:
             return False
@@ -228,12 +308,6 @@ class MediaRuntime:
                 message.id,
             )
             return True
-
-        notification_key = await self._register_new_media_notification(
-            source_chat_id,
-            message,
-            kind,
-        )
 
         temp = self.temp_dir / f"source_{uuid4().hex}"
 
@@ -315,59 +389,68 @@ class MediaRuntime:
                 Path(temp).unlink(missing_ok=True)
 
 
+
     def _notification_key(
         self,
         source_chat_id: int,
-        message,
+        messages: list,
     ) -> str:
-        grouped_id = getattr(message, "grouped_id", None)
-        if grouped_id:
-            return f"album:{int(source_chat_id)}:{int(grouped_id)}"
+        grouped_ids = {
+            int(grouped_id)
+            for grouped_id in (
+                getattr(message, "grouped_id", None)
+                for message in messages
+            )
+            if grouped_id is not None
+        }
 
-        # Non-album messages from the same source are grouped only during
-        # a short debounce window.
-        return f"single:{int(source_chat_id)}"
+        if len(grouped_ids) == 1:
+            grouped_id = next(iter(grouped_ids))
+            return (
+                f"album:{int(source_chat_id)}:"
+                f"{grouped_id}"
+            )
 
-    async def _register_new_media_notification(
+        first_id = min(int(message.id) for message in messages)
+        last_id = max(int(message.id) for message in messages)
+        return (
+            f"burst:{int(source_chat_id)}:"
+            f"{first_id}:{last_id}"
+        )
+
+    async def _register_media_batch(
         self,
         source_chat_id: int,
-        message,
-        kind: str,
+        messages: list,
     ) -> str:
         key = self._notification_key(
             source_chat_id,
-            message,
+            messages,
         )
 
-        bucket = self.pending_notifications.setdefault(
-            key,
-            {
-                "source_chat_id": int(source_chat_id),
-                "counts": defaultdict(int),
-                "expected": 0,
-                "processed": 0,
-                "uploaded": 0,
-                "duplicate": 0,
-                "queued": 0,
-                "failed": 0,
-                "message_id": None,
-                "chat_name": None,
-                "last_update": asyncio.get_running_loop().time(),
-            },
-        )
+        counts = defaultdict(int)
+        for message in messages:
+            kind = media_kind(message)
+            if kind:
+                counts[kind] += 1
 
-        bucket["counts"][kind] += 1
-        bucket["expected"] += 1
-        bucket["last_update"] = asyncio.get_running_loop().time()
+        bucket = {
+            "source_chat_id": int(source_chat_id),
+            "counts": counts,
+            "expected": sum(counts.values()),
+            "processed": 0,
+            "uploaded": 0,
+            "duplicate": 0,
+            "queued": 0,
+            "failed": 0,
+            "failed_items": [],
+            "message_id": None,
+            "chat_name": None,
+        }
+        self.pending_notifications[key] = bucket
 
-        current = self.notification_tasks.get(key)
-        if current and not current.done():
-            current.cancel()
-
-        self.notification_tasks[key] = asyncio.create_task(
-            self._notification_debounce(key)
-        )
-
+        # Send one Processing message before any item in the batch completes.
+        await self._send_processing_notification(key)
         return key
 
     async def _update_notification_result(
@@ -379,6 +462,7 @@ class MediaRuntime:
         duplicate: int = 0,
         queued: int = 0,
         failed: int = 0,
+        failed_item: dict | None = None,
     ) -> None:
         bucket = self.pending_notifications.get(key)
         if not bucket:
@@ -390,6 +474,11 @@ class MediaRuntime:
         bucket["queued"] += queued
         bucket["failed"] += failed
 
+        if failed_item:
+            bucket.setdefault("failed_items", []).append(
+                dict(failed_item)
+            )
+
         # If the initial message has already been sent and all detected media
         # finished processing, edit that same message immediately.
         if (
@@ -399,34 +488,41 @@ class MediaRuntime:
         ):
             await self._finalize_notification(key)
 
-    async def _notification_debounce(
+    async def _message_link(
         self,
-        key: str,
-    ) -> None:
+        chat_id: int,
+        message_id: int,
+    ) -> str | None:
+        if not self.client:
+            return None
+
         try:
-            # Resetting this task whenever another item arrives ensures
-            # one album/burst produces one notification.
-            await asyncio.sleep(NEW_MEDIA_GROUP_WINDOW)
+            entity = await self.client.get_entity(
+                int(chat_id)
+            )
+            username = getattr(entity, "username", None)
 
-            bucket = self.pending_notifications.get(key)
-            if not bucket:
-                return
+            if username:
+                return (
+                    f"https://t.me/{username}/"
+                    f"{int(message_id)}"
+                )
 
-            await self._send_processing_notification(key)
-
-            if (
-                bucket["processed"] + bucket["failed"]
-                >= bucket["expected"]
-            ):
-                await self._finalize_notification(key)
-
-        except asyncio.CancelledError:
-            raise
+            raw_id = str(abs(int(chat_id)))
+            if raw_id.startswith("100"):
+                return (
+                    f"https://t.me/c/{raw_id[3:]}/"
+                    f"{int(message_id)}"
+                )
         except Exception:
             log.exception(
-                "Notification debounce failed: key=%s",
-                key,
+                "Failed media link generation failed: "
+                "chat=%s message=%s",
+                chat_id,
+                message_id,
             )
+
+        return None
 
     async def _resolve_chat_name(
         self,
@@ -550,6 +646,53 @@ class MediaRuntime:
             final_text += (
                 f"\nFailed: <b>{bucket['failed']}</b>"
             )
+
+            failed_items = bucket.get(
+                "failed_items",
+                [],
+            )
+
+            if failed_items:
+                final_text += (
+                    "\n\n━━━━━━━━━━━━━━"
+                    "\n\n❌ <b>Failed Media</b>"
+                )
+
+                for index, item in enumerate(
+                    failed_items[:10],
+                    start=1,
+                ):
+                    kind_name = str(
+                        item.get("kind", "unknown")
+                    ).title()
+                    message_id = int(
+                        item.get("message_id", 0)
+                    )
+                    reason = str(
+                        item.get("reason", "Unknown error")
+                    )
+                    link = item.get("link")
+
+                    final_text += (
+                        f"\n\n<b>{index}.</b> "
+                        f"{kind_name}"
+                        f"\nMessage ID: "
+                        f"<code>{message_id}</code>"
+                        f"\nReason: "
+                        f"<code>{reason}</code>"
+                    )
+
+                    if link:
+                        final_text += (
+                            f'\n🔗 <a href="{link}">'
+                            "Open Source Media</a>"
+                        )
+
+                if len(failed_items) > 10:
+                    final_text += (
+                        f"\n\n+{len(failed_items) - 10} "
+                        "more failed items"
+                    )
 
         try:
             await self.alert_bot.edit_message_text(
