@@ -396,6 +396,7 @@ class ControlBot:
                         "destination_chat_ids"
                     ] if int(item) != chat_id
                 ]
+                await self.db.cancel_destination_queue(chat_id)
                 disabled = [
                     item for item in settings.get(
                         "disabled_destination_chat_ids", []
@@ -407,6 +408,9 @@ class ControlBot:
                 )
 
             elif mode == "database":
+                if settings.get("service_enabled"):
+                    await self.db.update_settings(service_enabled=0)
+                    await self.runtime.stop()
                 await self.db.update_settings(
                     database_chat_id=None,
                     database_chat_enabled=1,
@@ -621,16 +625,15 @@ class ControlBot:
                         parse_mode="HTML",
                     )
 
-                chats = await self.get_accessible_chats()
-                chat_map = {int(chat["id"]): chat for chat in chats}
-                if chat_id not in chat_map:
+                try:
+                    chat = await self.get_chat_by_id(chat_id)
+                except Exception as exc:
                     return await update.message.reply_text(
-                        "This Chat ID is not available in the connected "
-                        "Telegram account. Copy an ID from the list above.",
+                        f"Chat could not be opened: {exc}"
                     )
 
                 settings = await self.db.get_settings()
-                chat_name = chat_map[chat_id]["name"]
+                chat_name = chat["name"]
 
                 if mode == "source":
                     selected = list(settings["source_chat_ids"])
@@ -783,6 +786,38 @@ class ControlBot:
             parse_mode="HTML",
         )
 
+
+    async def get_chat_by_id(self, chat_id: int) -> dict:
+        settings = await self.db.get_settings()
+        if not settings["session_encrypted"]:
+            raise RuntimeError("Connect Telegram account first.")
+        api_hash = decrypt_text(self.fernet, settings["api_hash_encrypted"])
+        session = decrypt_text(self.fernet, settings["session_encrypted"])
+        client = TelegramClient(
+            StringSession(session), int(settings["api_id"]), api_hash
+        )
+        await client.connect()
+        try:
+            entity = await client.get_entity(int(chat_id))
+            is_group_or_channel = bool(
+                getattr(entity, "megagroup", False)
+                or getattr(entity, "broadcast", False)
+                or entity.__class__.__name__ in {"Chat", "Channel"}
+            )
+            if not is_group_or_channel:
+                raise RuntimeError("Chat ID is not a group or channel")
+            name = (
+                getattr(entity, "title", None)
+                or getattr(entity, "username", None)
+                or str(chat_id)
+            )
+            return {
+                "id": int(chat_id),
+                "name": str(name),
+                "protected": bool(getattr(entity, "noforwards", False)),
+            }
+        finally:
+            await client.disconnect()
 
     async def get_accessible_chats(self):
         settings = await self.db.get_settings()

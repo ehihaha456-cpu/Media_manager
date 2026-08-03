@@ -199,27 +199,36 @@ class Database:
         chat_id: int,
         **values,
     ) -> None:
+        values = dict(values)
         values["chat_id"] = int(chat_id)
         values["updated_at"] = now()
 
+        defaults = {
+            "created_at": now(),
+            "cursor_message_id": 0,
+            "processed": 0,
+            "uploaded": 0,
+            "duplicates": 0,
+            "failed": 0,
+            "total_media": 0,
+            "videos": 0,
+            "photos": 0,
+            "audio": 0,
+            "files": 0,
+        }
+        # MongoDB rejects the same path in $set and $setOnInsert.
+        set_on_insert = {
+            key: value
+            for key, value in defaults.items()
+            if key not in values
+        }
+        update = {"$set": values}
+        if set_on_insert:
+            update["$setOnInsert"] = set_on_insert
+
         await self.source_history_scans.update_one(
             {"_id": str(int(chat_id))},
-            {
-                "$set": values,
-                "$setOnInsert": {
-                    "created_at": now(),
-                    "cursor_message_id": 0,
-                    "processed": 0,
-                    "uploaded": 0,
-                    "duplicates": 0,
-                    "failed": 0,
-                    "total_media": 0,
-                    "videos": 0,
-                    "photos": 0,
-                    "audio": 0,
-                    "files": 0,
-                },
-            },
+            update,
             upsert=True,
         )
 
@@ -350,46 +359,48 @@ class Database:
             .limit(int(limit))
         )
         async for queue in cursor:
+            queue_id = int(queue["_id"])
             media = await self.media.find_one(
                 {"_id": int(queue["media_id"])}
             )
-
             if not media:
                 await self.publish_queue.update_one(
-                    {"_id": int(queue["_id"])},
-                    {
-                        "$set": {
-                            "status": "failed",
-                            "last_error": (
-                                "Linked media record was not found"
-                            ),
-                        },
-                        "$inc": {"attempts": 1},
-                    },
-                )
-                log.error(
-                    "Orphan queue item marked failed: "
-                    "queue=%s media_id=%s",
-                    queue.get("id"),
-                    queue.get("media_id"),
+                    {"_id": queue_id},
+                    {"$set": {
+                        "status": "failed",
+                        "last_error": "Linked media record was not found",
+                        "failed_at": now(),
+                    }, "$inc": {"attempts": 1}},
                 )
                 continue
 
-            rows.append(
-                {
-                    "queue_id": int(queue["id"]),
-                    "destination_chat_id": int(
-                        queue["destination_chat_id"]
-                    ),
-                    "source_chat_id": int(media["source_chat_id"]),
-                    "source_message_id": int(media["source_message_id"]),
-                    "database_chat_id": int(media["database_chat_id"]),
-                    "database_message_id": int(
-                        media["database_message_id"]
-                    ),
-                    "caption": media.get("caption"),
-                }
-            )
+            source_chat_id = media.get("source_chat_id")
+            source_message_id = media.get("source_message_id")
+            database_chat_id = media.get("database_chat_id")
+            database_message_id = media.get("database_message_id")
+
+            has_source = source_chat_id is not None and source_message_id is not None
+            has_database = database_chat_id is not None and database_message_id is not None
+            if not has_source and not has_database:
+                await self.publish_queue.update_one(
+                    {"_id": queue_id},
+                    {"$set": {
+                        "status": "failed",
+                        "last_error": "Media has no Source or Database reference",
+                        "failed_at": now(),
+                    }, "$inc": {"attempts": 1}},
+                )
+                continue
+
+            rows.append({
+                "queue_id": int(queue.get("id", queue_id)),
+                "destination_chat_id": int(queue["destination_chat_id"]),
+                "source_chat_id": int(source_chat_id) if has_source else None,
+                "source_message_id": int(source_message_id) if has_source else None,
+                "database_chat_id": int(database_chat_id) if has_database else None,
+                "database_message_id": int(database_message_id) if has_database else None,
+                "caption": media.get("caption"),
+            })
         return rows
 
     async def mark_published(self, queue_id: int) -> None:
@@ -409,14 +420,40 @@ class Database:
         queue_id: int,
         error: Exception | str,
     ) -> None:
+        queue = await self.publish_queue.find_one(
+            {"_id": int(queue_id)}, {"attempts": 1}
+        ) or {}
+        attempts = int(queue.get("attempts", 0)) + 1
+        status = "failed" if attempts >= 5 else "pending"
         await self.publish_queue.update_one(
             {"_id": int(queue_id)},
             {
+                "$set": {
+                    "status": status,
+                    "last_error": str(error)[:1000],
+                    "failed_at": now() if status == "failed" else None,
+                },
                 "$inc": {"attempts": 1},
-                "$set": {"last_error": str(error)[:1000]},
             },
         )
 
+    async def cancel_destination_queue(
+        self,
+        destination_chat_id: int,
+    ) -> None:
+        await self.publish_queue.update_many(
+            {
+                "destination_chat_id": int(destination_chat_id),
+                "status": "pending",
+            },
+            {
+                "$set": {
+                    "status": "cancelled",
+                    "last_error": "Destination disconnected",
+                    "failed_at": now(),
+                }
+            },
+        )
 
     async def increment_activity(
         self,

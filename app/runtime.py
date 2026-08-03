@@ -55,8 +55,8 @@ class MediaRuntime:
         if not settings["service_enabled"] or self.running:
             return
 
-        if not settings.get("database_chat_id"):
-            raise RuntimeError("Select a Database chat first")
+        if not settings.get("database_chat_active"):
+            raise RuntimeError("Enable a Database chat first")
         if not settings.get("active_source_chat_ids"):
             raise RuntimeError("Select at least one Source chat")
         if not settings.get("active_destination_chat_ids"):
@@ -1101,13 +1101,6 @@ class MediaRuntime:
         settings = await self.db.get_settings()
         database_chat_id = int(settings["database_chat_id"])
 
-        if getattr(message, "noforwards", False):
-            log.warning(
-                "Protected source skipped: chat=%s message=%s",
-                source_chat_id,
-                message.id,
-            )
-            return True
 
         temp = self.temp_dir / f"source_{uuid4().hex}"
 
@@ -1886,96 +1879,80 @@ class MediaRuntime:
             return
 
         settings = await self.db.get_settings()
+        active_destinations = {
+            int(value)
+            for value in settings.get("active_destination_chat_ids", [])
+        }
         rows = await self.db.pending(
-            max(1, int(settings["publish_batch_size"]))
+            max(1, int(settings.get("publish_batch_size", 1)))
         )
 
         for row in rows:
             queue_id = int(row["queue_id"])
             temp_path: Path | None = None
-
             try:
-                message = await self.client.get_messages(
-                    int(row["database_chat_id"]),
-                    ids=int(row["database_message_id"]),
-                )
-
-                # Old queue records may point to a Database message that was
-                # deleted. Fall back to the original Source message.
-                if not message or not getattr(message, "media", None):
-                    message = await self.client.get_messages(
-                        int(row["source_chat_id"]),
-                        ids=int(row["source_message_id"]),
-                    )
-
-                if not message or not getattr(message, "media", None):
-                    error_text = (
-                        "Database and Source media messages were not found"
-                    )
+                destination_id = int(row["destination_chat_id"])
+                if destination_id not in active_destinations:
                     await self.db.publish_queue.update_one(
                         {"_id": queue_id},
-                        {
-                            "$set": {
-                                "status": "failed",
-                                "last_error": error_text,
-                            },
-                            "$inc": {"attempts": 1},
-                        },
-                    )
-                    log.error(
-                        "Queue item permanently failed: queue=%s reason=%s",
-                        queue_id,
-                        error_text,
+                        {"$set": {
+                            "status": "cancelled",
+                            "last_error": "Destination is disabled or disconnected",
+                        }},
                     )
                     continue
 
-                destination_id = int(row["destination_chat_id"])
-                kind = media_kind(message)
+                message = None
+                if row.get("database_chat_id") is not None:
+                    message = await self.client.get_messages(
+                        int(row["database_chat_id"]),
+                        ids=int(row["database_message_id"]),
+                    )
+                if not message or not getattr(message, "media", None):
+                    if row.get("source_chat_id") is not None:
+                        message = await self.client.get_messages(
+                            int(row["source_chat_id"]),
+                            ids=int(row["source_message_id"]),
+                        )
 
+                if not message or not getattr(message, "media", None):
+                    await self.db.publish_queue.update_one(
+                        {"_id": queue_id},
+                        {"$set": {
+                            "status": "failed",
+                            "last_error": "Database and Source media were not found",
+                            "failed_at": datetime.now(timezone.utc),
+                        }, "$inc": {"attempts": 1}},
+                    )
+                    continue
+
+                kind = media_kind(message)
                 try:
-                    # Fast server-side copy where Telegram allows it.
                     await self.client.send_file(
                         destination_id,
                         message.media,
-                        caption=row["caption"] or None,
+                        caption=row.get("caption") or None,
                         supports_streaming=(kind == "video"),
                     )
                 except Exception:
-                    # Protected/restricted chats may reject direct media reuse.
-                    # Download and re-upload as a reliable fallback.
-                    temp_path = self.temp_dir / (
-                        f"publish_{queue_id}_{uuid4().hex}"
-                    )
-                    downloaded = await message.download_media(
-                        file=str(temp_path)
-                    )
+                    temp_path = self.temp_dir / f"publish_{queue_id}_{uuid4().hex}"
+                    downloaded = await message.download_media(file=str(temp_path))
                     if not downloaded:
-                        raise RuntimeError(
-                            "Media download fallback returned no file"
-                        )
-
+                        raise RuntimeError("Media download fallback returned no file")
                     temp_path = Path(downloaded)
                     await self.client.send_file(
                         destination_id,
                         temp_path,
-                        caption=row["caption"] or None,
+                        caption=row.get("caption") or None,
                         supports_streaming=(kind == "video"),
                     )
 
                 await self.db.mark_published(queue_id)
-
-                log.info(
-                    "Published queued media: queue=%s destination=%s",
-                    queue_id,
-                    destination_id,
-                )
-
+                log.info("Published queued media: queue=%s destination=%s", queue_id, destination_id)
             except Exception as exc:
                 await self.db.mark_failed(queue_id, exc)
-                log.exception(
-                    "Scheduled publishing failed: queue=%s",
-                    queue_id,
-                )
+                log.exception("Scheduled publishing failed: queue=%s", queue_id)
             finally:
                 if temp_path:
                     temp_path.unlink(missing_ok=True)
+
