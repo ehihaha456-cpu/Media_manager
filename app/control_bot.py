@@ -236,12 +236,15 @@ class ControlBot:
 
         if action == "duplicates":
             enabled = bool(settings["delete_duplicates"])
+            alerts = bool(settings.get("duplicate_alerts", 1))
             return await q.edit_message_text(
-                f"🧹 <b>Duplicate Settings</b>\n\nAuto delete: "
-                f"{'Enabled ✅' if enabled else 'Disabled ❌'}",
+                "🧹 <b>Duplicate Settings</b>\n\n"
+                f"Auto delete: {'Enabled ✅' if enabled else 'Disabled ❌'}\n"
+                f"Owner alerts: {'Enabled ✅' if alerts else 'Disabled ❌'}",
                 parse_mode="HTML",
                 reply_markup=keyboard([
                     [("Toggle Auto Delete", "toggle_duplicates")],
+                    [("Toggle Owner Alerts", "toggle_duplicate_alerts")],
                     [("⬅️ Back", "back")],
                 ]),
             )

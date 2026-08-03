@@ -67,6 +67,8 @@ async def main() -> None:
         database,
         fernet,
         config.temp_dir,
+        config.bot_token,
+        config.owner_id,
     )
     health_server = await start_health_server()
 

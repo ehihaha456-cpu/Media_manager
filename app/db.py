@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from pymongo import ASCENDING, AsyncMongoClient, ReturnDocument
+from pymongo.errors import DuplicateKeyError
 
 
 def now() -> datetime:
@@ -20,6 +21,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "database_chat_id": None,
     "destination_chat_ids": [],
     "delete_duplicates": 0,
+    "duplicate_alerts": 1,
     "copy_to_database": 1,
     "queue_for_publishing": 1,
     "publish_interval_minutes": 60,
@@ -120,6 +122,40 @@ class Database:
     async def find_by_hash(self, sha256: str) -> dict | None:
         document = await self.media.find_one({"sha256": sha256})
         return dict(document) if document else None
+
+
+async def register_media(
+    self,
+    sha256: str,
+    kind: str,
+    size: int,
+    chat_id: int,
+    message_id: int,
+    caption: str | None,
+) -> tuple[bool, dict]:
+    media_id = await self._next_id("media")
+    document = {
+        "_id": media_id,
+        "id": media_id,
+        "sha256": sha256,
+        "media_kind": kind,
+        "size_bytes": int(size),
+        "source_chat_id": int(chat_id),
+        "source_message_id": int(message_id),
+        "database_chat_id": int(chat_id),
+        "database_message_id": int(message_id),
+        "caption": caption,
+        "created_at": now(),
+    }
+
+    try:
+        await self.media.insert_one(document)
+        return True, document
+    except DuplicateKeyError:
+        existing = await self.media.find_one({"sha256": sha256})
+        if existing is None:
+            raise
+        return False, dict(existing)
 
     async def add_media(
         self,

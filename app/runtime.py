@@ -8,6 +8,7 @@ from uuid import uuid4
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
+from telegram import Bot
 
 from .crypto import decrypt_text
 from .media import media_kind, sha256_file
@@ -34,10 +35,19 @@ MODE_LIMITS = {
 
 
 class MediaRuntime:
-    def __init__(self, db, fernet, temp_dir):
+    def __init__(
+        self,
+        db,
+        fernet,
+        temp_dir,
+        bot_token: str,
+        owner_id: int,
+    ):
         self.db = db
         self.fernet = fernet
         self.temp_dir = temp_dir
+        self.alert_bot = Bot(token=bot_token)
+        self.owner_id = int(owner_id)
         self.client: TelegramClient | None = None
         self.scheduler: AsyncIOScheduler | None = None
         self.media_queue: asyncio.Queue[tuple[int, int]] = asyncio.Queue(
@@ -46,6 +56,106 @@ class MediaRuntime:
         self.worker_tasks: list[asyncio.Task] = []
         self._started = False
         self._queued_messages: set[tuple[int, int]] = set()
+
+
+async def _message_link(
+    self,
+    chat_id: int,
+    message_id: int,
+) -> str | None:
+    if not self.client:
+        return None
+
+    try:
+        entity = await self.client.get_entity(int(chat_id))
+        username = getattr(entity, "username", None)
+        if username:
+            return f"https://t.me/{username}/{int(message_id)}"
+
+        raw_id = str(abs(int(chat_id)))
+        if raw_id.startswith("100"):
+            return (
+                f"https://t.me/c/{raw_id[3:]}/"
+                f"{int(message_id)}"
+            )
+    except Exception:
+        log.exception(
+            "Could not build message link: chat=%s message=%s",
+            chat_id,
+            message_id,
+        )
+    return None
+
+async def _send_duplicate_alert(
+    self,
+    *,
+    database_chat_id: int,
+    duplicate_message_id: int,
+    original: dict,
+    media_kind_name: str,
+    file_size: int,
+    sha256: str,
+    delete_status: str,
+) -> None:
+    settings = await self.db.get_settings()
+    if not settings.get("duplicate_alerts", 1):
+        return
+
+    original_chat_id = int(
+        original.get("database_chat_id")
+        or original.get("source_chat_id")
+    )
+    original_message_id = int(
+        original.get("database_message_id")
+        or original.get("source_message_id")
+    )
+
+    original_link = await self._message_link(
+        original_chat_id,
+        original_message_id,
+    )
+    duplicate_link = await self._message_link(
+        database_chat_id,
+        duplicate_message_id,
+    )
+
+    original_text = (
+        f'<a href="{original_link}">Open original media</a>'
+        if original_link
+        else (
+            f"Original: chat <code>{original_chat_id}</code>, "
+            f"message <code>{original_message_id}</code>"
+        )
+    )
+    duplicate_text = (
+        f'<a href="{duplicate_link}">Open duplicate media</a>'
+        if duplicate_link
+        else (
+            f"Duplicate: chat <code>{database_chat_id}</code>, "
+            f"message <code>{duplicate_message_id}</code>"
+        )
+    )
+
+    size_mb = file_size / (1024 * 1024)
+    alert_text = (
+        "⚠️ <b>Duplicate Media Detected</b>\n\n"
+        f"Type: <b>{media_kind_name.title()}</b>\n"
+        f"Size: <b>{size_mb:.2f} MB</b>\n"
+        f"Hash: <code>{sha256[:16]}…</code>\n\n"
+        f"📂 {original_text}\n"
+        f"🆕 {duplicate_text}\n\n"
+        f"Action: {delete_status}"
+    )
+
+    try:
+        await self.alert_bot.send_message(
+            chat_id=self.owner_id,
+            text=alert_text,
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
+    except Exception:
+        log.exception("Could not send duplicate alert")
 
     async def start(self):
         settings = await self.db.get_settings()
@@ -339,52 +449,7 @@ class MediaRuntime:
 
             path = Path(downloaded)
             digest = await asyncio.to_thread(sha256_file, path)
-            existing = await self.db.find_by_hash(digest)
-
-            if existing:
-                same_database_message = (
-                    existing.get("database_chat_id") is not None
-                    and existing.get("database_message_id") is not None
-                    and int(existing["database_chat_id"])
-                    == database_chat_id
-                    and int(existing["database_message_id"])
-                    == int(message_id)
-                )
-                same_original = (
-                    int(existing["source_chat_id"])
-                    == database_chat_id
-                    and int(existing["source_message_id"])
-                    == int(message_id)
-                )
-
-                if same_database_message or same_original:
-                    return
-
-                log.info(
-                    "Database duplicate detected: message=%s "
-                    "worker=%s",
-                    message_id,
-                    worker_number,
-                )
-
-                if settings["delete_duplicates"]:
-                    try:
-                        await self.client.delete_messages(
-                            database_chat_id,
-                            [int(message_id)],
-                        )
-                        log.info(
-                            "Database duplicate deleted: message=%s",
-                            message_id,
-                        )
-                    except Exception:
-                        log.exception(
-                            "Database duplicate delete failed. "
-                            "Connected account needs delete permission."
-                        )
-                return
-
-            media_id = await self.db.add_media(
+            inserted, media_record = await self.db.register_media(
                 digest,
                 kind,
                 path.stat().st_size,
@@ -392,11 +457,64 @@ class MediaRuntime:
                 int(message_id),
                 message.message or None,
             )
-            await self.db.set_database_message(
-                media_id,
-                database_chat_id,
-                int(message_id),
-            )
+
+            if not inserted:
+                original_chat_id = int(
+                    media_record.get("database_chat_id")
+                    or media_record.get("source_chat_id")
+                )
+                original_message_id = int(
+                    media_record.get("database_message_id")
+                    or media_record.get("source_message_id")
+                )
+
+                if (
+                    original_chat_id == database_chat_id
+                    and original_message_id == int(message_id)
+                ):
+                    return
+
+                delete_status = "ℹ️ Duplicate retained"
+
+                if settings["delete_duplicates"]:
+                    try:
+                        entity = await self.client.get_entity(
+                            database_chat_id
+                        )
+                        await self.client.delete_messages(
+                            entity,
+                            [int(message_id)],
+                            revoke=True,
+                        )
+                        delete_status = "✅ Duplicate deleted automatically"
+                        log.info(
+                            "Database duplicate deleted: message=%s",
+                            message_id,
+                        )
+                    except Exception as exc:
+                        delete_status = (
+                            "❌ Auto-delete failed: "
+                            f"<code>{type(exc).__name__}</code>"
+                        )
+                        log.exception(
+                            "Database duplicate delete failed: "
+                            "chat=%s message=%s",
+                            database_chat_id,
+                            message_id,
+                        )
+
+                await self._send_duplicate_alert(
+                    database_chat_id=database_chat_id,
+                    duplicate_message_id=int(message_id),
+                    original=media_record,
+                    media_kind_name=kind,
+                    file_size=path.stat().st_size,
+                    sha256=digest,
+                    delete_status=delete_status,
+                )
+                return
+
+            media_id = int(media_record["id"])
 
             if settings["queue_for_publishing"]:
                 destinations = [
