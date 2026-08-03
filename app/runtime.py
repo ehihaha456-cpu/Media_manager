@@ -16,7 +16,7 @@ from .media import media_kind, sha256_file
 log = logging.getLogger(__name__)
 
 POLL_SECONDS = 2
-INITIAL_RECENT_MESSAGES = 5
+INITIAL_RECENT_MESSAGES = 50
 
 
 class MediaRuntime:
@@ -186,7 +186,7 @@ class MediaRuntime:
         role: str,
     ) -> None:
         if not self.client:
-            return
+            return False
 
         offset = await self.db.get_chat_offset(chat_id)
 
@@ -204,48 +204,70 @@ class MediaRuntime:
                 reverse=True,
             )
 
-        highest_id = int(offset or 0)
+        committed_offset = int(offset or 0)
 
         for message in messages:
-            highest_id = max(highest_id, int(message.id))
-
+            message_id = int(message.id)
             kind = media_kind(message)
+
+            # Non-media messages are safe to mark as seen immediately.
             if not kind:
+                committed_offset = message_id
+                await self.db.set_chat_offset(
+                    chat_id,
+                    committed_offset,
+                )
                 continue
 
             try:
                 if role == "source":
-                    await self._process_source_message(
+                    processed = await self._process_source_message(
                         chat_id,
                         message,
                         kind,
                     )
                 else:
-                    await self._process_database_message(
+                    processed = await self._process_database_message(
                         chat_id,
                         message,
                         kind,
                     )
-            except Exception:
-                log.exception(
-                    "%s media processing failed: chat=%s message=%s",
-                    role.title(),
+
+                if processed is False:
+                    log.warning(
+                        "%s media not completed; offset retained for retry: "
+                        "chat=%s message=%s",
+                        role.title(),
+                        chat_id,
+                        message_id,
+                    )
+                    break
+
+                # Commit after each successfully handled media message.
+                committed_offset = message_id
+                await self.db.set_chat_offset(
                     chat_id,
-                    message.id,
+                    committed_offset,
                 )
 
-        if highest_id > int(offset or 0):
-            await self.db.set_chat_offset(
-                chat_id,
-                highest_id,
-            )
+            except Exception:
+                # Do not move past a failed media message. It will retry
+                # during the next polling cycle instead of being lost.
+                log.exception(
+                    "%s media processing failed; will retry: "
+                    "chat=%s message=%s",
+                    role.title(),
+                    chat_id,
+                    message_id,
+                )
+                break
 
     async def _process_source_message(
         self,
         source_chat_id: int,
         message,
         kind: str,
-    ) -> None:
+    ) -> bool:
         if not self.client:
             return
 
@@ -258,7 +280,7 @@ class MediaRuntime:
                 source_chat_id,
                 message.id,
             )
-            return
+            return True
 
         temp = self.temp_dir / f"source_{uuid4().hex}"
 
@@ -298,19 +320,6 @@ class MediaRuntime:
                     )
                 )
 
-                # Advance Database offset over our own newly-uploaded message.
-                current_database_offset = (
-                    await self.db.get_chat_offset(
-                        database_chat_id
-                    )
-                    or 0
-                )
-                if int(sent.id) > current_database_offset:
-                    await self.db.set_chat_offset(
-                        database_chat_id,
-                        int(sent.id),
-                    )
-
                 if not inserted:
                     await self._handle_duplicate(
                         database_chat_id=database_chat_id,
@@ -320,7 +329,7 @@ class MediaRuntime:
                         size=path.stat().st_size,
                         digest=digest,
                     )
-                    return
+                    return True
 
                 await self._enqueue_destinations(
                     int(record["id"]),
@@ -334,6 +343,7 @@ class MediaRuntime:
                     database_chat_id,
                     sent.id,
                 )
+                return True
             finally:
                 Path(temp).unlink(missing_ok=True)
 
@@ -342,7 +352,7 @@ class MediaRuntime:
         database_chat_id: int,
         message,
         kind: str,
-    ) -> None:
+    ) -> bool:
         settings = await self.db.get_settings()
         temp = self.temp_dir / f"database_{uuid4().hex}"
 
@@ -387,7 +397,7 @@ class MediaRuntime:
                         original_chat_id == database_chat_id
                         and original_message_id == int(message.id)
                     ):
-                        return
+                        return True
 
                     await self._handle_duplicate(
                         database_chat_id=database_chat_id,
@@ -397,7 +407,7 @@ class MediaRuntime:
                         size=path.stat().st_size,
                         digest=digest,
                     )
-                    return
+                    return True
 
                 await self._enqueue_destinations(
                     int(record["id"]),
@@ -409,6 +419,7 @@ class MediaRuntime:
                     database_chat_id,
                     message.id,
                 )
+                return True
             finally:
                 Path(temp).unlink(missing_ok=True)
 
