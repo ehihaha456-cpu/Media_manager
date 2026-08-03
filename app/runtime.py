@@ -341,6 +341,95 @@ class MediaRuntime:
                 )
 
                 if not inserted:
+                    original_chat_id = int(
+                        record.get("database_chat_id")
+                        or record.get("source_chat_id")
+                    )
+                    original_message_id = int(
+                        record.get("database_message_id")
+                        or record.get("source_message_id")
+                    )
+
+                    original_message = None
+                    try:
+                        original_message = await self.client.get_messages(
+                            original_chat_id,
+                            ids=original_message_id,
+                        )
+                    except Exception:
+                        log.exception(
+                            "Original duplicate candidate could not be fetched: "
+                            "chat=%s message=%s",
+                            original_chat_id,
+                            original_message_id,
+                        )
+
+                    original_is_valid = bool(
+                        original_message
+                        and media_kind(original_message)
+                    )
+
+                    if not original_is_valid:
+                        # Stale database entry: the original Telegram media no
+                        # longer exists. Remove the broken hash record and
+                        # register this newly uploaded Database copy as the new
+                        # canonical original.
+                        await self.db.media.delete_one(
+                            {"_id": record["_id"]}
+                        )
+
+                        inserted_again, fresh_record = (
+                            await self.db.register_database_media(
+                                sha256=digest,
+                                kind=kind,
+                                size=path.stat().st_size,
+                                database_chat_id=database_chat_id,
+                                database_message_id=int(sent.id),
+                                caption=message.message or None,
+                                source_chat_id=source_chat_id,
+                                source_message_id=int(message.id),
+                            )
+                        )
+
+                        if not inserted_again:
+                            raise RuntimeError(
+                                "Stale duplicate record could not be replaced"
+                            )
+
+                        for destination in settings["destination_chat_ids"]:
+                            destination_id = int(destination)
+                            if destination_id != database_chat_id:
+                                await self.db.enqueue(
+                                    int(fresh_record["id"]),
+                                    destination_id,
+                                )
+
+                        await self._update_notification_result(
+                            notification_key,
+                            uploaded=1,
+                            queued=1,
+                            processed=1,
+                        )
+
+                        log.info(
+                            "Stale duplicate record replaced with new original: "
+                            "source=%s/%s database=%s/%s",
+                            source_chat_id,
+                            message.id,
+                            database_chat_id,
+                            sent.id,
+                        )
+                        return True
+
+                    original_link = await self._message_link(
+                        original_chat_id,
+                        original_message_id,
+                    )
+                    duplicate_link = await self._message_link(
+                        source_chat_id,
+                        int(message.id),
+                    )
+
                     try:
                         entity = await self.client.get_entity(
                             database_chat_id
@@ -359,6 +448,14 @@ class MediaRuntime:
                         notification_key,
                         duplicate=1,
                         processed=1,
+                        duplicate_pair={
+                            "original_link": original_link,
+                            "duplicate_link": duplicate_link,
+                            "original_chat_id": original_chat_id,
+                            "original_message_id": original_message_id,
+                            "duplicate_chat_id": source_chat_id,
+                            "duplicate_message_id": int(message.id),
+                        },
                     )
                     return True
 
@@ -441,6 +538,7 @@ class MediaRuntime:
             "processed": 0,
             "uploaded": 0,
             "duplicate": 0,
+            "duplicate_pairs": [],
             "queued": 0,
             "failed": 0,
             "failed_items": [],
@@ -463,6 +561,7 @@ class MediaRuntime:
         queued: int = 0,
         failed: int = 0,
         failed_item: dict | None = None,
+        duplicate_pair: dict | None = None,
     ) -> None:
         bucket = self.pending_notifications.get(key)
         if not bucket:
@@ -477,6 +576,11 @@ class MediaRuntime:
         if failed_item:
             bucket.setdefault("failed_items", []).append(
                 dict(failed_item)
+            )
+
+        if duplicate_pair:
+            bucket.setdefault("duplicate_pairs", []).append(
+                dict(duplicate_pair)
             )
 
         # If the initial message has already been sent and all detected media
@@ -641,6 +745,51 @@ class MediaRuntime:
             f"Duplicates: <b>{bucket['duplicate']}</b>\n"
             f"Destination Queue: <b>{bucket['queued']}</b>"
         )
+
+        duplicate_pairs = bucket.get(
+            "duplicate_pairs",
+            [],
+        )
+
+        if duplicate_pairs:
+            final_text += (
+                "\n\n📂 <b>Duplicate Files</b>"
+            )
+
+            for index, pair in enumerate(
+                duplicate_pairs[:20],
+                start=1,
+            ):
+                original_link = pair.get("original_link")
+                duplicate_link = pair.get("duplicate_link")
+
+                original_text = (
+                    f'<a href="{original_link}">📂 Original Media</a>'
+                    if original_link
+                    else (
+                        "📂 Original "
+                        f"<code>{pair.get('original_message_id')}</code>"
+                    )
+                )
+                duplicate_text = (
+                    f'<a href="{duplicate_link}">🆕 Duplicate Media</a>'
+                    if duplicate_link
+                    else (
+                        "🆕 Duplicate "
+                        f"<code>{pair.get('duplicate_message_id')}</code>"
+                    )
+                )
+
+                final_text += (
+                    f"\nFiles {index}: "
+                    f"{original_text}    {duplicate_text}"
+                )
+
+            if len(duplicate_pairs) > 20:
+                final_text += (
+                    f"\n+{len(duplicate_pairs) - 20} "
+                    "more duplicate pairs"
+                )
 
         if bucket["failed"] > 0:
             final_text += (
