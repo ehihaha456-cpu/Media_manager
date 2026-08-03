@@ -265,93 +265,93 @@ class Database:
         )
 
 
-async def increment_activity(
-    self,
-    *,
-    processed: int = 0,
-    uploaded: int = 0,
-    duplicates: int = 0,
-    failed: int = 0,
-) -> None:
-    increments = {
-        "processed": int(processed),
-        "uploaded": int(uploaded),
-        "duplicates": int(duplicates),
-        "failed": int(failed),
-    }
-    increments = {
-        key: value
-        for key, value in increments.items()
-        if value
-    }
-    if not increments:
-        return
-
-    india_now = datetime.now(
-        timezone(timedelta(hours=5, minutes=30))
-    )
-    day_key = india_now.strftime("%Y-%m-%d")
-
-    await self.activity_stats.update_one(
-        {"_id": "total"},
-        {
-            "$inc": increments,
-            "$set": {"updated_at": now()},
-        },
-        upsert=True,
-    )
-    await self.activity_stats.update_one(
-        {"_id": f"day:{day_key}"},
-        {
-            "$inc": increments,
-            "$set": {
-                "date": day_key,
-                "updated_at": now(),
-            },
-        },
-        upsert=True,
-    )
-
-async def dashboard_statistics(self) -> dict:
-    india_now = datetime.now(
-        timezone(timedelta(hours=5, minutes=30))
-    )
-    day_key = india_now.strftime("%Y-%m-%d")
-
-    total = (
-        await self.activity_stats.find_one({"_id": "total"})
-        or {}
-    )
-    today = (
-        await self.activity_stats.find_one(
-            {"_id": f"day:{day_key}"}
-        )
-        or {}
-    )
-
-    destination_queue = (
-        await self.publish_queue.count_documents(
-            {"status": "pending"}
-        )
-    )
-
-    def values(document: dict) -> dict:
-        return {
-            "processed": int(document.get("processed", 0)),
-            "uploaded": int(document.get("uploaded", 0)),
-            "duplicates": int(document.get("duplicates", 0)),
-            "failed": int(document.get("failed", 0)),
+    async def increment_activity(
+        self,
+        *,
+        processed: int = 0,
+        uploaded: int = 0,
+        duplicates: int = 0,
+        failed: int = 0,
+    ) -> None:
+        increments = {
+            "processed": int(processed),
+            "uploaded": int(uploaded),
+            "duplicates": int(duplicates),
+            "failed": int(failed),
         }
-
-    return {
-        "total": values(total),
-        "today": values(today),
-        # Source -> Database is processed immediately, so there is no
-        # separate persistent Database queue in this engine.
-        "database_queue": 0,
-        "destination_queue": int(destination_queue),
-    }
-
+        increments = {
+            key: value
+            for key, value in increments.items()
+            if value
+        }
+        if not increments:
+            return
+    
+        india_now = datetime.now(
+            timezone(timedelta(hours=5, minutes=30))
+        )
+        day_key = india_now.strftime("%Y-%m-%d")
+    
+        await self.activity_stats.update_one(
+            {"_id": "total"},
+            {
+                "$inc": increments,
+                "$set": {"updated_at": now()},
+            },
+            upsert=True,
+        )
+        await self.activity_stats.update_one(
+            {"_id": f"day:{day_key}"},
+            {
+                "$inc": increments,
+                "$set": {
+                    "date": day_key,
+                    "updated_at": now(),
+                },
+            },
+            upsert=True,
+        )
+    
+    async def dashboard_statistics(self) -> dict:
+        india_now = datetime.now(
+            timezone(timedelta(hours=5, minutes=30))
+        )
+        day_key = india_now.strftime("%Y-%m-%d")
+    
+        total = (
+            await self.activity_stats.find_one({"_id": "total"})
+            or {}
+        )
+        today = (
+            await self.activity_stats.find_one(
+                {"_id": f"day:{day_key}"}
+            )
+            or {}
+        )
+    
+        destination_queue = (
+            await self.publish_queue.count_documents(
+                {"status": "pending"}
+            )
+        )
+    
+        def values(document: dict) -> dict:
+            return {
+                "processed": int(document.get("processed", 0)),
+                "uploaded": int(document.get("uploaded", 0)),
+                "duplicates": int(document.get("duplicates", 0)),
+                "failed": int(document.get("failed", 0)),
+            }
+    
+        return {
+            "total": values(total),
+            "today": values(today),
+            # Source -> Database is processed immediately, so there is no
+            # separate persistent Database queue in this engine.
+            "database_queue": 0,
+            "destination_queue": int(destination_queue),
+        }
+    
     async def statistics(self) -> dict:
         return {
             "media": await self.media.count_documents({}),
