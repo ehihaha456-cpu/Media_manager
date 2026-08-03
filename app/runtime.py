@@ -58,6 +58,7 @@ class MediaRuntime:
         self.notification_tasks: dict[str, asyncio.Task] = {}
         self.source_history_tasks: dict[int, asyncio.Task] = {}
         self.entity_cache: dict[int, object] = {}
+        self.self_uploaded_database_ids: set[int] = set()
 
     async def start(self) -> None:
         settings = await self.db.get_settings()
@@ -173,6 +174,7 @@ class MediaRuntime:
             self.client = None
 
         self.entity_cache.clear()
+        self.self_uploaded_database_ids.clear()
         log.info("Media runtime stopped")
 
     async def restart(self) -> None:
@@ -645,6 +647,15 @@ class MediaRuntime:
             await self._poll_database_chat(database_chat_id)
 
 
+
+    def _mark_self_uploaded_database_message(
+        self,
+        message_id: int,
+    ) -> None:
+        self.self_uploaded_database_ids.add(int(message_id))
+        if len(self.self_uploaded_database_ids) > 5000:
+            keep = sorted(self.self_uploaded_database_ids)[-2500:]
+            self.self_uploaded_database_ids = set(keep)
 
     async def _poll_database_chat(
         self,
@@ -1412,6 +1423,8 @@ class MediaRuntime:
                         kind,
                         message.message or None,
                     )
+
+                self._mark_self_uploaded_database_message(int(sent.id))
 
                 inserted, record = await self.db.register_database_media(
                     sha256=digest,
