@@ -236,8 +236,28 @@ class Database:
             media = await self.media.find_one(
                 {"_id": int(queue["media_id"])}
             )
+
             if not media:
+                await self.publish_queue.update_one(
+                    {"_id": int(queue["_id"])},
+                    {
+                        "$set": {
+                            "status": "failed",
+                            "last_error": (
+                                "Linked media record was not found"
+                            ),
+                        },
+                        "$inc": {"attempts": 1},
+                    },
+                )
+                log.error(
+                    "Orphan queue item marked failed: "
+                    "queue=%s media_id=%s",
+                    queue.get("id"),
+                    queue.get("media_id"),
+                )
                 continue
+
             rows.append(
                 {
                     "queue_id": int(queue["id"]),
