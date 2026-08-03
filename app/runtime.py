@@ -861,19 +861,6 @@ class MediaRuntime:
                             raise RuntimeError(
                                 "Could not replace stale media record"
                             )
-    
-                        queued = 0
-                        for destination in settings[
-                            "destination_chat_ids"
-                        ]:
-                            destination_id = int(destination)
-                            if destination_id != database_chat_id:
-                                await self.db.enqueue(
-                                    int(record["id"]),
-                                    destination_id,
-                                )
-                                queued += 1
-    
                         current_link = await self._message_link(
                             database_chat_id,
                             int(message.id),
@@ -883,8 +870,6 @@ class MediaRuntime:
                         ]["file_results"][int(message.id)]["index"]
                         await self._update_notification_result(
                             notification_key,
-                            uploaded=1,
-                            queued=queued,
                             processed=1,
                             processed_pair={
                                 "index": file_index,
@@ -919,17 +904,27 @@ class MediaRuntime:
                             revoke=True,
                         )
     
+                    file_index = self.pending_notifications[
+                        notification_key
+                    ]["file_results"][int(message.id)]["index"]
+
                     await self._update_notification_result(
                         notification_key,
                         duplicate=1,
                         processed=1,
                         duplicate_pair={
+                            "index": file_index,
                             "original_link": original_link,
                             "duplicate_link": duplicate_link,
                             "original_chat_id": original_chat_id,
                             "original_message_id": original_message_id,
                             "duplicate_chat_id": database_chat_id,
                             "duplicate_message_id": int(message.id),
+                        },
+                        file_result={
+                            "message_id": int(message.id),
+                            "status": "duplicate",
+                            "source_link": duplicate_link,
                         },
                     )
                     return
@@ -948,17 +943,6 @@ class MediaRuntime:
                     raise RuntimeError(
                         "Database media registration race detected"
                     )
-    
-                queued = 0
-                for destination in settings["active_destination_chat_ids"]:
-                    destination_id = int(destination)
-                    if destination_id != database_chat_id:
-                        await self.db.enqueue(
-                            int(record["id"]),
-                            destination_id,
-                        )
-                        queued += 1
-    
                 current_link = await self._message_link(
                     database_chat_id,
                     int(message.id),
@@ -968,8 +952,6 @@ class MediaRuntime:
                 ]["file_results"][int(message.id)]["index"]
                 await self._update_notification_result(
                     notification_key,
-                    uploaded=1,
-                    queued=queued,
                     processed=1,
                     processed_pair={
                         "index": file_index,
