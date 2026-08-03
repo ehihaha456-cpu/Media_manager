@@ -133,6 +133,22 @@ class Database:
         document = await self.media.find_one({"sha256": sha256})
         return dict(document) if document else None
 
+    async def find_by_database_message(
+        self,
+        database_chat_id: int,
+        database_message_id: int,
+    ) -> dict | None:
+        document = await self.media.find_one(
+            {
+                "database_chat_id": int(database_chat_id),
+                "database_message_id": int(database_message_id),
+            }
+        )
+        return dict(document) if document else None
+
+    async def delete_media_record(self, media_id: int) -> None:
+        await self.media.delete_one({"_id": int(media_id)})
+
     async def register_database_media(
         self,
         *,
