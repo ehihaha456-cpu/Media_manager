@@ -58,105 +58,105 @@ class MediaRuntime:
         self._queued_messages: set[tuple[int, int]] = set()
 
 
-async def _message_link(
-    self,
-    chat_id: int,
-    message_id: int,
-) -> str | None:
-    if not self.client:
-        return None
-
-    try:
-        entity = await self.client.get_entity(int(chat_id))
-        username = getattr(entity, "username", None)
-        if username:
-            return f"https://t.me/{username}/{int(message_id)}"
-
-        raw_id = str(abs(int(chat_id)))
-        if raw_id.startswith("100"):
-            return (
-                f"https://t.me/c/{raw_id[3:]}/"
-                f"{int(message_id)}"
+    async def _message_link(
+        self,
+        chat_id: int,
+        message_id: int,
+    ) -> str | None:
+        if not self.client:
+            return None
+    
+        try:
+            entity = await self.client.get_entity(int(chat_id))
+            username = getattr(entity, "username", None)
+            if username:
+                return f"https://t.me/{username}/{int(message_id)}"
+    
+            raw_id = str(abs(int(chat_id)))
+            if raw_id.startswith("100"):
+                return (
+                    f"https://t.me/c/{raw_id[3:]}/"
+                    f"{int(message_id)}"
+                )
+        except Exception:
+            log.exception(
+                "Could not build message link: chat=%s message=%s",
+                chat_id,
+                message_id,
             )
-    except Exception:
-        log.exception(
-            "Could not build message link: chat=%s message=%s",
-            chat_id,
-            message_id,
+        return None
+    
+    async def _send_duplicate_alert(
+        self,
+        *,
+        database_chat_id: int,
+        duplicate_message_id: int,
+        original: dict,
+        media_kind_name: str,
+        file_size: int,
+        sha256: str,
+        delete_status: str,
+    ) -> None:
+        settings = await self.db.get_settings()
+        if not settings.get("duplicate_alerts", 1):
+            return
+    
+        original_chat_id = int(
+            original.get("database_chat_id")
+            or original.get("source_chat_id")
         )
-    return None
-
-async def _send_duplicate_alert(
-    self,
-    *,
-    database_chat_id: int,
-    duplicate_message_id: int,
-    original: dict,
-    media_kind_name: str,
-    file_size: int,
-    sha256: str,
-    delete_status: str,
-) -> None:
-    settings = await self.db.get_settings()
-    if not settings.get("duplicate_alerts", 1):
-        return
-
-    original_chat_id = int(
-        original.get("database_chat_id")
-        or original.get("source_chat_id")
-    )
-    original_message_id = int(
-        original.get("database_message_id")
-        or original.get("source_message_id")
-    )
-
-    original_link = await self._message_link(
-        original_chat_id,
-        original_message_id,
-    )
-    duplicate_link = await self._message_link(
-        database_chat_id,
-        duplicate_message_id,
-    )
-
-    original_text = (
-        f'<a href="{original_link}">Open original media</a>'
-        if original_link
-        else (
-            f"Original: chat <code>{original_chat_id}</code>, "
-            f"message <code>{original_message_id}</code>"
+        original_message_id = int(
+            original.get("database_message_id")
+            or original.get("source_message_id")
         )
-    )
-    duplicate_text = (
-        f'<a href="{duplicate_link}">Open duplicate media</a>'
-        if duplicate_link
-        else (
-            f"Duplicate: chat <code>{database_chat_id}</code>, "
-            f"message <code>{duplicate_message_id}</code>"
+    
+        original_link = await self._message_link(
+            original_chat_id,
+            original_message_id,
         )
-    )
-
-    size_mb = file_size / (1024 * 1024)
-    alert_text = (
-        "⚠️ <b>Duplicate Media Detected</b>\n\n"
-        f"Type: <b>{media_kind_name.title()}</b>\n"
-        f"Size: <b>{size_mb:.2f} MB</b>\n"
-        f"Hash: <code>{sha256[:16]}…</code>\n\n"
-        f"📂 {original_text}\n"
-        f"🆕 {duplicate_text}\n\n"
-        f"Action: {delete_status}"
-    )
-
-    try:
-        await self.alert_bot.send_message(
-            chat_id=self.owner_id,
-            text=alert_text,
-            parse_mode="HTML",
-            disable_web_page_preview=True,
+        duplicate_link = await self._message_link(
+            database_chat_id,
+            duplicate_message_id,
         )
-    except Exception:
-        log.exception("Could not send duplicate alert")
-
+    
+        original_text = (
+            f'<a href="{original_link}">Open original media</a>'
+            if original_link
+            else (
+                f"Original: chat <code>{original_chat_id}</code>, "
+                f"message <code>{original_message_id}</code>"
+            )
+        )
+        duplicate_text = (
+            f'<a href="{duplicate_link}">Open duplicate media</a>'
+            if duplicate_link
+            else (
+                f"Duplicate: chat <code>{database_chat_id}</code>, "
+                f"message <code>{duplicate_message_id}</code>"
+            )
+        )
+    
+        size_mb = file_size / (1024 * 1024)
+        alert_text = (
+            "⚠️ <b>Duplicate Media Detected</b>\n\n"
+            f"Type: <b>{media_kind_name.title()}</b>\n"
+            f"Size: <b>{size_mb:.2f} MB</b>\n"
+            f"Hash: <code>{sha256[:16]}…</code>\n\n"
+            f"📂 {original_text}\n"
+            f"🆕 {duplicate_text}\n\n"
+            f"Action: {delete_status}"
+        )
+    
+        try:
+            await self.alert_bot.send_message(
+                chat_id=self.owner_id,
+                text=alert_text,
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+            )
+        except Exception:
+            log.exception("Could not send duplicate alert")
+    
     async def start(self):
         settings = await self.db.get_settings()
         if not settings["service_enabled"]:
