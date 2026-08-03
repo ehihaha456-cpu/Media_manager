@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+from contextlib import suppress
+from uuid import uuid4
 
 from .config import load_app_config
 from .control_bot import ControlBot
@@ -44,6 +46,51 @@ async def start_health_server() -> asyncio.AbstractServer:
         port,
     )
     return server
+
+
+
+
+async def maintain_polling_lock(
+    database: Database,
+    lock_id: str,
+    owner_id: str,
+) -> None:
+    while True:
+        await asyncio.sleep(15)
+        renewed = await database.renew_runtime_lock(
+            lock_id,
+            owner_id,
+            lease_seconds=45,
+        )
+        if not renewed:
+            raise RuntimeError("Polling ownership lock was lost")
+
+
+async def wait_for_polling_lock(
+    database: Database,
+    lock_id: str,
+    owner_id: str,
+) -> None:
+    log = logging.getLogger(__name__)
+    while True:
+        try:
+            acquired = await database.acquire_runtime_lock(
+                lock_id,
+                owner_id,
+                lease_seconds=45,
+            )
+        except Exception:
+            log.exception("Could not acquire polling lock")
+            acquired = False
+
+        if acquired:
+            log.info("Exclusive bot polling lock acquired")
+            return
+
+        log.warning(
+            "Another deployment owns bot polling; retrying in 10 seconds"
+        )
+        await asyncio.sleep(10)
 
 
 async def main() -> None:
@@ -88,17 +135,53 @@ async def main() -> None:
     )
     app = control.build()
 
+    lock_id = f"telegram-polling:{config.bot_token.split(':', 1)[0]}"
+    lock_owner = uuid4().hex
+    lock_task: asyncio.Task | None = None
+
     try:
+        await wait_for_polling_lock(
+            database,
+            lock_id,
+            lock_owner,
+        )
+        lock_task = asyncio.create_task(
+            maintain_polling_lock(
+                database,
+                lock_id,
+                lock_owner,
+            ),
+            name="telegram-polling-lock",
+        )
+
         async with app:
             await app.start()
             await app.updater.start_polling(
                 allowed_updates=[
                     "message",
                     "callback_query",
-                ]
+                ],
+                drop_pending_updates=False,
             )
-            await asyncio.Event().wait()
+
+            wait_forever = asyncio.create_task(
+                asyncio.Event().wait(),
+                name="application-wait",
+            )
+            done, pending = await asyncio.wait(
+                {wait_forever, lock_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            for task in pending:
+                task.cancel()
+            for task in done:
+                task.result()
     finally:
+        if lock_task:
+            lock_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await lock_task
+
         await runtime.stop()
         health_server.close()
         await health_server.wait_closed()
@@ -108,6 +191,11 @@ async def main() -> None:
         if app.running:
             await app.stop()
 
+        with suppress(Exception):
+            await database.release_runtime_lock(
+                lock_id,
+                lock_owner,
+            )
         await database.close()
 
 

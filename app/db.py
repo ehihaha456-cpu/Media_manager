@@ -53,6 +53,7 @@ class Database:
         self.chat_offsets = self.database["chat_offsets"]
         self.activity_stats = self.database["activity_stats"]
         self.source_history_scans = self.database["source_history_scans"]
+        self.runtime_locks = self.database["runtime_locks"]
 
     async def initialize(self) -> None:
         await self.client.admin.command("ping")
@@ -78,6 +79,64 @@ class Database:
 
     async def close(self) -> None:
         await self.client.close()
+
+    async def acquire_runtime_lock(
+        self,
+        lock_id: str,
+        owner_id: str,
+        lease_seconds: int = 45,
+    ) -> bool:
+        current = now()
+        expires_at = current + timedelta(seconds=lease_seconds)
+
+        document = await self.runtime_locks.find_one_and_update(
+            {
+                "_id": lock_id,
+                "$or": [
+                    {"owner_id": owner_id},
+                    {"expires_at": {"$lte": current}},
+                    {"expires_at": {"$exists": False}},
+                ],
+            },
+            {
+                "$set": {
+                    "owner_id": owner_id,
+                    "expires_at": expires_at,
+                    "updated_at": current,
+                },
+                "$setOnInsert": {"created_at": current},
+            },
+            upsert=True,
+            return_document=ReturnDocument.AFTER,
+        )
+        return bool(document and document.get("owner_id") == owner_id)
+
+    async def renew_runtime_lock(
+        self,
+        lock_id: str,
+        owner_id: str,
+        lease_seconds: int = 45,
+    ) -> bool:
+        current = now()
+        result = await self.runtime_locks.update_one(
+            {"_id": lock_id, "owner_id": owner_id},
+            {
+                "$set": {
+                    "expires_at": current + timedelta(seconds=lease_seconds),
+                    "updated_at": current,
+                }
+            },
+        )
+        return result.modified_count == 1
+
+    async def release_runtime_lock(
+        self,
+        lock_id: str,
+        owner_id: str,
+    ) -> None:
+        await self.runtime_locks.delete_one(
+            {"_id": lock_id, "owner_id": owner_id}
+        )
 
     async def _next_id(self, name: str) -> int:
         document = await self.counters.find_one_and_update(
