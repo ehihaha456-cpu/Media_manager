@@ -10,6 +10,7 @@ from uuid import uuid4
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from telegram import Bot
 from telethon import TelegramClient
+from telethon.errors import FloodWaitError
 from telethon.sessions import StringSession
 from telethon.tl.types import (
     DocumentAttributeAudio,
@@ -28,6 +29,8 @@ NEW_MEDIA_GROUP_WINDOW = 3
 HISTORY_PAGE_SIZE = 100
 HISTORY_MEDIA_BATCH_SIZE = 10
 HISTORY_PROGRESS_EVERY = 100
+UPLOAD_FLOOD_RETRIES = 3
+ENTITY_CACHE_LIMIT = 256
 
 
 class MediaRuntime:
@@ -54,6 +57,7 @@ class MediaRuntime:
         self.pending_notifications: dict[str, dict] = {}
         self.notification_tasks: dict[str, asyncio.Task] = {}
         self.source_history_tasks: dict[int, asyncio.Task] = {}
+        self.entity_cache: dict[int, object] = {}
 
     async def start(self) -> None:
         settings = await self.db.get_settings()
@@ -1206,14 +1210,79 @@ class MediaRuntime:
         if not self.client:
             raise RuntimeError("Telegram client is not connected")
 
+        chat_id = int(chat_id)
+        cached = self.entity_cache.get(chat_id)
+        if cached is not None:
+            return cached
+
         try:
-            return await self.client.get_input_entity(int(chat_id))
+            peer = await self.client.get_input_entity(chat_id)
         except Exception:
             # Refresh dialogs once so recently joined private groups/channels
             # become available in Telethon's entity cache.
             async for _ in self.client.iter_dialogs(limit=None):
                 pass
-            return await self.client.get_input_entity(int(chat_id))
+            peer = await self.client.get_input_entity(chat_id)
+
+        if len(self.entity_cache) >= ENTITY_CACHE_LIMIT:
+            self.entity_cache.pop(next(iter(self.entity_cache)))
+        self.entity_cache[chat_id] = peer
+        return peer
+
+    async def _send_file_with_retry(self, target, file, **kwargs):
+        if not self.client:
+            raise RuntimeError("Telegram client is not connected")
+
+        for attempt in range(UPLOAD_FLOOD_RETRIES + 1):
+            try:
+                return await self.client.send_file(
+                    target,
+                    file,
+                    **kwargs,
+                )
+            except FloodWaitError as exc:
+                if attempt >= UPLOAD_FLOOD_RETRIES:
+                    raise
+                wait_seconds = max(1, int(exc.seconds))
+                log.warning(
+                    "Telegram FloodWait during upload; waiting %ss "
+                    "(attempt %s/%s)",
+                    wait_seconds,
+                    attempt + 1,
+                    UPLOAD_FLOOD_RETRIES,
+                )
+                await asyncio.sleep(wait_seconds)
+
+    async def _try_server_side_copy(
+        self,
+        target_chat_id: int,
+        message,
+        kind: str,
+        caption: str | None,
+    ):
+        if not self.client or not getattr(message, "media", None):
+            return None
+
+        target = await self._resolve_peer(target_chat_id)
+        try:
+            return await self._send_file_with_retry(
+                target,
+                message.media,
+                caption=caption,
+                supports_streaming=(kind == "video"),
+            )
+        except Exception:
+            # Protected/restricted chats and expired file references can reject
+            # server-side reuse. The caller will use the existing local
+            # download/re-upload path without changing behavior.
+            log.info(
+                "Fast server-side copy unavailable; using upload fallback: "
+                "source=%s/%s target=%s",
+                getattr(message, "chat_id", None),
+                getattr(message, "id", None),
+                target_chat_id,
+            )
+            return None
 
     async def _upload_downloaded_media(
         self,
@@ -1252,7 +1321,7 @@ class MediaRuntime:
             if thumb_path:
                 kwargs["thumb"] = thumb_path
 
-            return await self.client.send_file(
+            return await self._send_file_with_retry(
                 target,
                 path,
                 **kwargs,
@@ -1280,8 +1349,26 @@ class MediaRuntime:
 
         async with self.processing_lock:
             try:
+                # For normal chats, Telegram can copy the existing media on
+                # its own servers. Run that copy in parallel with the local
+                # download/hash needed for duplicate detection. Restricted
+                # media automatically falls back to the original upload path.
+                fast_copy_task = asyncio.create_task(
+                    self._try_server_side_copy(
+                        database_chat_id,
+                        message,
+                        kind,
+                        message.message or None,
+                    )
+                )
+
                 downloaded = await message.download_media(file=str(temp))
                 if not downloaded:
+                    fast_copy_task.cancel()
+                    await asyncio.gather(
+                        fast_copy_task,
+                        return_exceptions=True,
+                    )
                     raise RuntimeError(
                         "Source media download returned no file"
                     )
@@ -1289,13 +1376,15 @@ class MediaRuntime:
                 path = Path(downloaded)
                 digest = await asyncio.to_thread(sha256_file, path)
 
-                sent = await self._upload_downloaded_media(
-                    database_chat_id,
-                    path,
-                    message,
-                    kind,
-                    message.message or None,
-                )
+                sent = await fast_copy_task
+                if sent is None:
+                    sent = await self._upload_downloaded_media(
+                        database_chat_id,
+                        path,
+                        message,
+                        kind,
+                        message.message or None,
+                    )
 
                 inserted, record = await self.db.register_database_media(
                     sha256=digest,
@@ -2106,7 +2195,7 @@ class MediaRuntime:
                     destination_peer = await self._resolve_peer(
                         destination_id
                     )
-                    await self.client.send_file(
+                    await self._send_file_with_retry(
                         destination_peer,
                         message.media,
                         caption=row.get("caption") or None,
