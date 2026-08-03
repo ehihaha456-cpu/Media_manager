@@ -10,7 +10,7 @@ from uuid import uuid4
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from telegram import Bot
 from telethon import TelegramClient
-from telethon.errors import FloodWaitError
+from telethon.errors import FloodWaitError, PeerIdInvalidError
 from telethon.sessions import StringSession
 from telethon.tl.types import (
     DocumentAttributeAudio,
@@ -172,6 +172,7 @@ class MediaRuntime:
             await self.client.disconnect()
             self.client = None
 
+        self.entity_cache.clear()
         log.info("Media runtime stopped")
 
     async def restart(self) -> None:
@@ -1206,11 +1207,19 @@ class MediaRuntime:
             )
             return None
 
-    async def _resolve_peer(self, chat_id: int):
+    async def _resolve_peer(
+        self,
+        chat_id: int,
+        *,
+        force_refresh: bool = False,
+    ):
         if not self.client:
             raise RuntimeError("Telegram client is not connected")
 
         chat_id = int(chat_id)
+        if force_refresh:
+            self.entity_cache.pop(chat_id, None)
+
         cached = self.entity_cache.get(chat_id)
         if cached is not None:
             return cached
@@ -1218,28 +1227,62 @@ class MediaRuntime:
         try:
             peer = await self.client.get_input_entity(chat_id)
         except Exception:
-            # Refresh dialogs once so recently joined private groups/channels
-            # become available in Telethon's entity cache.
-            async for _ in self.client.iter_dialogs(limit=None):
-                pass
-            peer = await self.client.get_input_entity(chat_id)
+            # Refresh every dialog and match the exact Telegram dialog ID.
+            # This restores the access hash for private groups/channels and
+            # avoids reusing a stale InputPeer after reconnect/deploy.
+            peer = None
+            async for dialog in self.client.iter_dialogs(limit=None):
+                if int(dialog.id) == chat_id:
+                    peer = await self.client.get_input_entity(dialog.entity)
+                    break
+
+            if peer is None:
+                raise RuntimeError(
+                    f"Telegram account cannot access chat {chat_id}"
+                )
 
         if len(self.entity_cache) >= ENTITY_CACHE_LIMIT:
             self.entity_cache.pop(next(iter(self.entity_cache)))
         self.entity_cache[chat_id] = peer
         return peer
 
-    async def _send_file_with_retry(self, target, file, **kwargs):
+    async def _send_file_with_retry(
+        self,
+        target,
+        file,
+        *,
+        target_chat_id: int | None = None,
+        **kwargs,
+    ):
         if not self.client:
             raise RuntimeError("Telegram client is not connected")
+
+        current_target = target
+        peer_refreshed = False
 
         for attempt in range(UPLOAD_FLOOD_RETRIES + 1):
             try:
                 return await self.client.send_file(
-                    target,
+                    current_target,
                     file,
                     **kwargs,
                 )
+            except PeerIdInvalidError:
+                if target_chat_id is None or peer_refreshed:
+                    raise
+
+                peer_refreshed = True
+                chat_id = int(target_chat_id)
+                self.entity_cache.pop(chat_id, None)
+                log.warning(
+                    "Invalid/stale Telegram peer; refreshing target chat %s",
+                    chat_id,
+                )
+                current_target = await self._resolve_peer(
+                    chat_id,
+                    force_refresh=True,
+                )
+                continue
             except FloodWaitError as exc:
                 if attempt >= UPLOAD_FLOOD_RETRIES:
                     raise
@@ -1268,6 +1311,7 @@ class MediaRuntime:
             return await self._send_file_with_retry(
                 target,
                 message.media,
+                target_chat_id=target_chat_id,
                 caption=caption,
                 supports_streaming=(kind == "video"),
             )
@@ -1324,6 +1368,7 @@ class MediaRuntime:
             return await self._send_file_with_retry(
                 target,
                 path,
+                target_chat_id=target_chat_id,
                 **kwargs,
             )
         finally:
@@ -2198,6 +2243,7 @@ class MediaRuntime:
                     await self._send_file_with_retry(
                         destination_peer,
                         message.media,
+                        target_chat_id=destination_id,
                         caption=row.get("caption") or None,
                         supports_streaming=(kind == "video"),
                     )
