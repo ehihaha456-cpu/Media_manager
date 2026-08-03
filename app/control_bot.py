@@ -105,18 +105,30 @@ class ControlBot:
                         str(database_id),
                     )
     
+                disabled_sources = set(
+                    settings.get("disabled_source_chat_ids", [])
+                )
+                disabled_destinations = set(
+                    settings.get(
+                        "disabled_destination_chat_ids", []
+                    )
+                )
                 source_names = [
-                    chat_names.get(int(chat_id), str(chat_id))
+                    (
+                        chat_names.get(int(chat_id), str(chat_id)),
+                        int(chat_id) not in disabled_sources,
+                    )
                     for chat_id in settings.get(
-                        "source_chat_ids",
-                        [],
+                        "source_chat_ids", []
                     )
                 ]
                 destination_names = [
-                    chat_names.get(int(chat_id), str(chat_id))
+                    (
+                        chat_names.get(int(chat_id), str(chat_id)),
+                        int(chat_id) not in disabled_destinations,
+                    )
                     for chat_id in settings.get(
-                        "destination_chat_ids",
-                        [],
+                        "destination_chat_ids", []
                     )
                 ]
             except Exception:
@@ -132,15 +144,17 @@ class ControlBot:
         )
     
         database_line = (
-            f"└ ✅ {self._short_name(database_name)}"
+            f"└ {'✅' if settings.get('database_chat_active') else '❌'} "
+            f"{self._short_name(database_name)}"
             if database_name
             else "└ ❌ Not Connected"
         )
     
         source_lines = (
             "\n".join(
-                f"└ ✅ {self._short_name(name)}"
-                for name in source_names
+                f"└ {'✅' if enabled else '❌'} "
+                f"{self._short_name(name)}"
+                for name, enabled in source_names
             )
             if source_names
             else "└ ❌ No Source Chats"
@@ -148,8 +162,9 @@ class ControlBot:
     
         destination_lines = (
             "\n".join(
-                f"└ ✅ {self._short_name(name)}"
-                for name in destination_names
+                f"└ {'✅' if enabled else '❌'} "
+                f"{self._short_name(name)}"
+                for name, enabled in destination_names
             )
             if destination_names
             else "└ ❌ No Destination Chats"
@@ -288,73 +303,102 @@ class ControlBot:
             return await self.show_main(update)
 
         if action in {"source", "database", "destination"}:
-            return await self.show_chat_selector(update, context, action)
+            context.user_data["state"] = f"chat_id:{action}"
+            return await self.show_chat_manager(update, context, action)
 
-        if action.startswith("pickchat:"):
+        if action.startswith("togglechat:"):
             _, mode, raw_chat_id = action.split(":", 2)
             chat_id = int(raw_chat_id)
             settings = await self.db.get_settings()
 
-            if mode == "database":
-                await self.db.update_settings(database_chat_id=chat_id)
-                updated = await self.db.get_settings()
-                if updated["service_enabled"]:
-                    await self.runtime.restart()
-                await q.answer("Database chat selected ✅", show_alert=False)
-                return await self.show_main(update)
+            if mode == "source":
+                disabled = set(
+                    settings.get("disabled_source_chat_ids", [])
+                )
+                if chat_id in disabled:
+                    disabled.remove(chat_id)
+                else:
+                    disabled.add(chat_id)
+                await self.db.update_settings(
+                    disabled_source_chat_ids=sorted(disabled)
+                )
+
+            elif mode == "destination":
+                disabled = set(
+                    settings.get(
+                        "disabled_destination_chat_ids", []
+                    )
+                )
+                if chat_id in disabled:
+                    disabled.remove(chat_id)
+                else:
+                    disabled.add(chat_id)
+                await self.db.update_settings(
+                    disabled_destination_chat_ids=sorted(disabled)
+                )
+
+            elif mode == "database":
+                enabled = bool(
+                    settings.get("database_chat_enabled", 1)
+                )
+                await self.db.update_settings(
+                    database_chat_enabled=0 if enabled else 1
+                )
+
+            updated = await self.db.get_settings()
+            if updated["service_enabled"]:
+                await self.runtime.restart()
+            context.user_data["state"] = f"chat_id:{mode}"
+            return await self.show_chat_manager(update, context, mode)
+
+        if action.startswith("disconnectchat:"):
+            _, mode, raw_chat_id = action.split(":", 2)
+            chat_id = int(raw_chat_id)
+            settings = await self.db.get_settings()
 
             if mode == "source":
-                selected = [int(x) for x in settings["source_chat_ids"]]
-                is_new_source = chat_id not in selected
-
-                if is_new_source:
-                    selected.append(chat_id)
-                    message = (
-                        "Source selected — full history scan queued"
-                    )
-                    await self.runtime.register_source_history_scan(
-                        chat_id
-                    )
-                else:
-                    selected.remove(chat_id)
-                    message = "Source removed"
-                    await self.runtime.remove_source_history_scan(
-                        chat_id
-                    )
-
+                selected = [
+                    item for item in settings["source_chat_ids"]
+                    if int(item) != chat_id
+                ]
+                disabled = [
+                    item for item in settings.get(
+                        "disabled_source_chat_ids", []
+                    ) if int(item) != chat_id
+                ]
+                await self.runtime.remove_source_history_scan(chat_id)
                 await self.db.update_settings(
-                    source_chat_ids=selected
+                    source_chat_ids=selected,
+                    disabled_source_chat_ids=disabled,
                 )
 
-                updated = await self.db.get_settings()
-                if updated["service_enabled"]:
-                    await self.runtime.restart()
-
-                await q.answer(message, show_alert=False)
-                return await self.show_chat_selector(
-                    update,
-                    context,
-                    "source",
+            elif mode == "destination":
+                selected = [
+                    item for item in settings[
+                        "destination_chat_ids"
+                    ] if int(item) != chat_id
+                ]
+                disabled = [
+                    item for item in settings.get(
+                        "disabled_destination_chat_ids", []
+                    ) if int(item) != chat_id
+                ]
+                await self.db.update_settings(
+                    destination_chat_ids=selected,
+                    disabled_destination_chat_ids=disabled,
                 )
 
-            if mode == "destination":
-                selected = [int(x) for x in settings["destination_chat_ids"]]
-                if chat_id in selected:
-                    selected.remove(chat_id)
-                    message = "Destination removed"
-                else:
-                    selected.append(chat_id)
-                    message = "Destination selected"
-                await self.db.update_settings(destination_chat_ids=selected)
-                updated = await self.db.get_settings()
-                if updated["service_enabled"]:
-                    await self.runtime.restart()
-                await q.answer(message, show_alert=False)
-                return await self.show_chat_selector(update, context, "destination")
+            elif mode == "database":
+                await self.db.update_settings(
+                    database_chat_id=None,
+                    database_chat_enabled=1,
+                )
 
-        if action == "selector_done":
-            context.user_data.pop("selector_mode", None)
-            return await self.show_main(update)
+            updated = await self.db.get_settings()
+            if updated["service_enabled"]:
+                await self.runtime.restart()
+            context.user_data["state"] = f"chat_id:{mode}"
+            return await self.show_chat_manager(update, context, mode)
 
         if action == "duplicates":
             enabled = bool(settings["delete_duplicates"])
@@ -463,17 +507,17 @@ class ControlBot:
             else:
                 if not settings["session_encrypted"]:
                     return await q.answer("Connect Telegram account first.", show_alert=True)
-                if not settings["source_chat_ids"]:
+                if not settings["active_source_chat_ids"]:
                     return await q.answer(
                         "Add at least one Source chat.",
                         show_alert=True,
                     )
-                if not settings["database_chat_id"]:
+                if not settings["database_chat_active"]:
                     return await q.answer(
                         "Select a Database chat.",
                         show_alert=True,
                     )
-                if not settings["destination_chat_ids"]:
+                if not settings["active_destination_chat_ids"]:
                     return await q.answer(
                         "Add at least one Destination chat.",
                         show_alert=True,
@@ -547,6 +591,75 @@ class ControlBot:
                 client = self.pending_clients[update.effective_user.id]
                 await client.sign_in(password=value)
                 return await self.finish_login(update, context, client)
+
+            if state.startswith("chat_id:"):
+                mode = state.split(":", 1)[1]
+                try:
+                    chat_id = int(value.replace(" ", ""))
+                except ValueError:
+                    return await update.message.reply_text(
+                        "Send a valid numeric Chat ID, for example: "
+                        "<code>-1001234567890</code>",
+                        parse_mode="HTML",
+                    )
+
+                chats = await self.get_accessible_chats()
+                chat_map = {int(chat["id"]): chat for chat in chats}
+                if chat_id not in chat_map:
+                    return await update.message.reply_text(
+                        "This Chat ID is not available in the connected "
+                        "Telegram account. Copy an ID from the list above.",
+                    )
+
+                settings = await self.db.get_settings()
+                chat_name = chat_map[chat_id]["name"]
+
+                if mode == "source":
+                    selected = list(settings["source_chat_ids"])
+                    if chat_id not in selected:
+                        selected.append(chat_id)
+                        await self.db.update_settings(
+                            source_chat_ids=selected
+                        )
+                        await self.runtime.register_source_history_scan(
+                            chat_id
+                        )
+                    else:
+                        await update.message.reply_text(
+                            "Source is already connected."
+                        )
+
+                elif mode == "destination":
+                    selected = list(settings[
+                        "destination_chat_ids"
+                    ])
+                    if chat_id not in selected:
+                        selected.append(chat_id)
+                        await self.db.update_settings(
+                            destination_chat_ids=selected
+                        )
+                    else:
+                        await update.message.reply_text(
+                            "Destination is already connected."
+                        )
+
+                elif mode == "database":
+                    await self.db.update_settings(
+                        database_chat_id=chat_id,
+                        database_chat_enabled=1,
+                    )
+
+                updated = await self.db.get_settings()
+                if updated["service_enabled"]:
+                    await self.runtime.restart()
+
+                await update.message.reply_text(
+                    f"✅ {chat_name} connected successfully."
+                )
+                context.user_data["state"] = f"chat_id:{mode}"
+                return await self.show_chat_manager(
+                    update, context, mode, send_new=True
+                )
 
             if state == "interval":
                 raw = value.strip().lower()
@@ -693,63 +806,113 @@ class ControlBot:
 
         return chats
 
-    async def show_chat_selector(self, update, context, mode):
+    async def show_chat_manager(
+        self,
+        update,
+        context,
+        mode: str,
+        *,
+        send_new: bool = False,
+    ):
         try:
             chats = await self.get_accessible_chats()
         except Exception as exc:
-            return await update.callback_query.answer(str(exc), show_alert=True)
-
-        if not chats:
-            return await update.callback_query.edit_message_text(
-                "No accessible groups or channels were found.",
-                reply_markup=keyboard([[("⬅️ Back", "back")]]),
-            )
+            if update.callback_query:
+                return await update.callback_query.answer(
+                    str(exc), show_alert=True
+                )
+            return await update.effective_message.reply_text(str(exc))
 
         settings = await self.db.get_settings()
-        context.user_data["selector_mode"] = mode
+        context.user_data["state"] = f"chat_id:{mode}"
+        chat_names = {
+            int(chat["id"]): str(chat["name"])
+            for chat in chats
+        }
 
         if mode == "source":
-            selected_ids = {
-                int(chat_id) for chat_id in settings["source_chat_ids"]
-            }
             title = "📥 <b>Source Groups/Channels</b>"
-            summary = f"Connected: {len(selected_ids)}"
-        elif mode == "database":
-            selected_ids = (
-                {int(settings["database_chat_id"])}
-                if settings["database_chat_id"]
-                else set()
+            connected = list(settings["source_chat_ids"])
+            disabled = set(
+                settings.get("disabled_source_chat_ids", [])
             )
-            title = "🗄 <b>Database Group/Channel</b>"
-            summary = (
-                "Connected: 1" if selected_ids else "Connected: 0"
+        elif mode == "destination":
+            title = "📤 <b>Destination Groups/Channels</b>"
+            connected = list(settings["destination_chat_ids"])
+            disabled = set(
+                settings.get(
+                    "disabled_destination_chat_ids", []
+                )
             )
         else:
-            selected_ids = {
-                int(chat_id) for chat_id in settings["destination_chat_ids"]
-            }
-            title = "📤 <b>Destination Groups/Channels</b>"
-            summary = f"Connected: {len(selected_ids)}"
+            title = "🗄 <b>Database Group/Channel</b>"
+            connected = (
+                [int(settings["database_chat_id"])]
+                if settings.get("database_chat_id")
+                else []
+            )
+            disabled = set()
+            if connected and not settings.get(
+                "database_chat_enabled", 1
+            ):
+                disabled.add(connected[0])
+
+        joined_lines = []
+        for index, chat in enumerate(chats[:40], start=1):
+            lock = " 🔒" if chat.get("protected") else ""
+            joined_lines.append(
+                f"{index}. <b>{self._short_name(chat['name'], 40)}</b>"
+                f"{lock}\n   <code>{int(chat['id'])}</code>"
+            )
+
+        if len(chats) > 40:
+            joined_lines.append(
+                f"\nShowing first 40 of {len(chats)} chats."
+            )
+
+        text = (
+            f"{title}\n\n"
+            f"Connected: <b>{len(connected)}</b>\n\n"
+            "<b>Your joined groups/channels</b>\n\n"
+            + ("\n\n".join(joined_lines) if joined_lines else "No chats found.")
+            + "\n\n━━━━━━━━━━━━━━━━━━\n\n"
+            "Copy a Chat ID from above, paste it below, and send it.\n\n"
+            "Example: <code>-1001234567890</code>"
+        )
 
         rows = []
-        for chat in chats[:40]:
-            chat_id = int(chat["id"])
-            prefix = "✅ " if chat_id in selected_ids else ""
-            label = prefix + chat["name"]
+        for chat_id in connected:
+            enabled = int(chat_id) not in disabled
+            name = self._short_name(
+                chat_names.get(int(chat_id), str(chat_id)), 22
+            )
+            rows.append([
+                (
+                    f"{'✅' if enabled else '❌'} {name}",
+                    f"togglechat:{mode}:{int(chat_id)}",
+                ),
+                (
+                    "❌ Disconnect",
+                    f"disconnectchat:{mode}:{int(chat_id)}",
+                ),
+            ])
 
-            if len(label) > 34:
-                label = label[:31] + "..."
-            if chat["protected"]:
-                label += " 🔒"
+        rows.append([("⬅️ Back", "back")])
+        markup = keyboard(rows)
 
-            rows.append([(label, f"pickchat:{mode}:{chat_id}")])
+        if update.callback_query and not send_new:
+            return await update.callback_query.edit_message_text(
+                text,
+                parse_mode="HTML",
+                reply_markup=markup,
+                disable_web_page_preview=True,
+            )
 
-        rows.append([("✅ Done", "selector_done"), ("⬅️ Back", "back")])
-
-        await update.callback_query.edit_message_text(
-            f"{title}\n\n{summary}\n\nTap a chat to select or remove it.",
+        return await update.effective_message.reply_text(
+            text,
             parse_mode="HTML",
-            reply_markup=keyboard(rows),
+            reply_markup=markup,
+            disable_web_page_preview=True,
         )
 
     def build(self):

@@ -21,8 +21,11 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "phone_number": None,
     "session_encrypted": None,
     "source_chat_ids": [],
+    "disabled_source_chat_ids": [],
     "database_chat_id": None,
+    "database_chat_enabled": 1,
     "destination_chat_ids": [],
+    "disabled_destination_chat_ids": [],
     "delete_duplicates": 0,
     "duplicate_alerts": 1,
     "copy_to_database": 1,
@@ -96,6 +99,31 @@ class Database:
             int(value)
             for value in result.get("destination_chat_ids", [])
         ]
+        result["disabled_source_chat_ids"] = [
+            int(value)
+            for value in result.get("disabled_source_chat_ids", [])
+        ]
+        result["disabled_destination_chat_ids"] = [
+            int(value)
+            for value in result.get("disabled_destination_chat_ids", [])
+        ]
+
+        disabled_sources = set(result["disabled_source_chat_ids"])
+        disabled_destinations = set(
+            result["disabled_destination_chat_ids"]
+        )
+        result["active_source_chat_ids"] = [
+            chat_id for chat_id in result["source_chat_ids"]
+            if chat_id not in disabled_sources
+        ]
+        result["active_destination_chat_ids"] = [
+            chat_id for chat_id in result["destination_chat_ids"]
+            if chat_id not in disabled_destinations
+        ]
+        result["database_chat_active"] = bool(
+            result.get("database_chat_id")
+            and result.get("database_chat_enabled", 1)
+        )
         return result
 
     async def update_settings(self, **values) -> None:

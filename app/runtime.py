@@ -57,9 +57,9 @@ class MediaRuntime:
 
         if not settings.get("database_chat_id"):
             raise RuntimeError("Select a Database chat first")
-        if not settings.get("source_chat_ids"):
+        if not settings.get("active_source_chat_ids"):
             raise RuntimeError("Select at least one Source chat")
-        if not settings.get("destination_chat_ids"):
+        if not settings.get("active_destination_chat_ids"):
             raise RuntimeError("Select at least one Destination chat")
 
         api_hash = decrypt_text(
@@ -112,13 +112,13 @@ class MediaRuntime:
 
         log.info(
             "Media polling runtime started | sources=%s database=%s",
-            settings["source_chat_ids"],
+            settings["active_source_chat_ids"],
             settings["database_chat_id"],
         )
 
         selected_sources = {
             int(chat_id)
-            for chat_id in settings["source_chat_ids"]
+            for chat_id in settings["active_source_chat_ids"]
         }
         for scan in await self.db.pending_source_history_scans():
             chat_id = int(scan["chat_id"])
@@ -597,7 +597,7 @@ class MediaRuntime:
 
         database_chat_id = int(settings["database_chat_id"])
 
-        for source_chat_id in settings["source_chat_ids"]:
+        for source_chat_id in settings["active_source_chat_ids"]:
             source_chat_id = int(source_chat_id)
             if source_chat_id == database_chat_id:
                 continue
@@ -616,7 +616,8 @@ class MediaRuntime:
 
             await self._poll_source_chat(source_chat_id)
 
-        await self._poll_database_chat(database_chat_id)
+        if settings.get("database_chat_active"):
+            await self._poll_database_chat(database_chat_id)
 
 
 
@@ -924,7 +925,7 @@ class MediaRuntime:
                     )
     
                 queued = 0
-                for destination in settings["destination_chat_ids"]:
+                for destination in settings["active_destination_chat_ids"]:
                     destination_id = int(destination)
                     if destination_id != database_chat_id:
                         await self.db.enqueue(
@@ -1195,7 +1196,7 @@ class MediaRuntime:
                                 "Stale duplicate record could not be replaced"
                             )
 
-                        for destination in settings["destination_chat_ids"]:
+                        for destination in settings["active_destination_chat_ids"]:
                             destination_id = int(destination)
                             if destination_id != database_chat_id:
                                 await self.db.enqueue(
@@ -1292,7 +1293,7 @@ class MediaRuntime:
                     )
                     return True
 
-                for destination in settings["destination_chat_ids"]:
+                for destination in settings["active_destination_chat_ids"]:
                     destination_id = int(destination)
                     if destination_id != database_chat_id:
                         await self.db.enqueue(
