@@ -21,8 +21,11 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "phone_number": None,
     "session_encrypted": None,
     "source_chat_ids": [],
+    "disabled_source_chat_ids": [],
     "database_chat_id": None,
+    "database_chat_enabled": 1,
     "destination_chat_ids": [],
+    "disabled_destination_chat_ids": [],
     "delete_duplicates": 0,
     "duplicate_alerts": 1,
     "copy_to_database": 1,
@@ -96,6 +99,54 @@ class Database:
             int(value)
             for value in result.get("destination_chat_ids", [])
         ]
+        result["disabled_source_chat_ids"] = [
+            int(value)
+            for value in result.get("disabled_source_chat_ids", [])
+        ]
+        result["disabled_destination_chat_ids"] = [
+            int(value)
+            for value in result.get("disabled_destination_chat_ids", [])
+        ]
+
+        raw_database_enabled = result.get(
+            "database_chat_enabled",
+            1,
+        )
+        if isinstance(raw_database_enabled, str):
+            normalized = raw_database_enabled.strip().lower()
+            result["database_chat_enabled"] = (
+                0
+                if normalized in {
+                    "",
+                    "0",
+                    "false",
+                    "off",
+                    "no",
+                    "disabled",
+                }
+                else 1
+            )
+        else:
+            result["database_chat_enabled"] = (
+                1 if bool(raw_database_enabled) else 0
+            )
+
+        disabled_sources = set(result["disabled_source_chat_ids"])
+        disabled_destinations = set(
+            result["disabled_destination_chat_ids"]
+        )
+        result["active_source_chat_ids"] = [
+            chat_id for chat_id in result["source_chat_ids"]
+            if chat_id not in disabled_sources
+        ]
+        result["active_destination_chat_ids"] = [
+            chat_id for chat_id in result["destination_chat_ids"]
+            if chat_id not in disabled_destinations
+        ]
+        result["database_chat_active"] = bool(
+            result.get("database_chat_id")
+            and result.get("database_chat_enabled", 1)
+        )
         return result
 
     async def update_settings(self, **values) -> None:
@@ -151,32 +202,24 @@ class Database:
         values["chat_id"] = int(chat_id)
         values["updated_at"] = now()
 
-        insert_defaults = {
-            "created_at": now(),
-            "cursor_message_id": 0,
-            "processed": 0,
-            "uploaded": 0,
-            "duplicates": 0,
-            "failed": 0,
-            "total_media": 0,
-            "videos": 0,
-            "photos": 0,
-            "audio": 0,
-            "files": 0,
-        }
-
-        # MongoDB rejects the same field appearing in both $set and
-        # $setOnInsert. Remove any supplied fields from the insert defaults.
-        for key in values:
-            insert_defaults.pop(key, None)
-
-        update = {"$set": values}
-        if insert_defaults:
-            update["$setOnInsert"] = insert_defaults
-
         await self.source_history_scans.update_one(
             {"_id": str(int(chat_id))},
-            update,
+            {
+                "$set": values,
+                "$setOnInsert": {
+                    "created_at": now(),
+                    "cursor_message_id": 0,
+                    "processed": 0,
+                    "uploaded": 0,
+                    "duplicates": 0,
+                    "failed": 0,
+                    "total_media": 0,
+                    "videos": 0,
+                    "photos": 0,
+                    "audio": 0,
+                    "files": 0,
+                },
+            },
             upsert=True,
         )
 
@@ -332,83 +375,17 @@ class Database:
                 )
                 continue
 
-            source_chat_id = media.get("source_chat_id")
-            source_message_id = media.get("source_message_id")
-            database_chat_id = media.get("database_chat_id")
-            database_message_id = media.get("database_message_id")
-
-            # Old records may not contain Database references. In that case,
-            # publish_pending can safely use the original Source message.
-            effective_database_chat_id = (
-                database_chat_id
-                if database_chat_id is not None
-                else source_chat_id
-            )
-            effective_database_message_id = (
-                database_message_id
-                if database_message_id is not None
-                else source_message_id
-            )
-
-            # At least one complete Telegram message reference is required.
-            source_complete = (
-                source_chat_id is not None
-                and source_message_id is not None
-            )
-            database_complete = (
-                effective_database_chat_id is not None
-                and effective_database_message_id is not None
-            )
-
-            if not source_complete and not database_complete:
-                await self.publish_queue.update_one(
-                    {"_id": int(queue["_id"])},
-                    {
-                        "$set": {
-                            "status": "failed",
-                            "last_error": (
-                                "Media has no usable Source or Database "
-                                "message reference"
-                            ),
-                        },
-                        "$inc": {"attempts": 1},
-                    },
-                )
-                log.error(
-                    "Incomplete queue item marked failed: "
-                    "queue=%s media_id=%s",
-                    queue.get("id"),
-                    queue.get("media_id"),
-                )
-                continue
-
-            # Keep both fields valid because runtime first checks Database and
-            # then falls back to Source. When Source itself is missing, use the
-            # available Database reference as the fallback too.
-            effective_source_chat_id = (
-                source_chat_id
-                if source_chat_id is not None
-                else effective_database_chat_id
-            )
-            effective_source_message_id = (
-                source_message_id
-                if source_message_id is not None
-                else effective_database_message_id
-            )
-
             rows.append(
                 {
                     "queue_id": int(queue["id"]),
                     "destination_chat_id": int(
                         queue["destination_chat_id"]
                     ),
-                    "source_chat_id": int(effective_source_chat_id),
-                    "source_message_id": int(effective_source_message_id),
-                    "database_chat_id": int(
-                        effective_database_chat_id
-                    ),
+                    "source_chat_id": int(media["source_chat_id"]),
+                    "source_message_id": int(media["source_message_id"]),
+                    "database_chat_id": int(media["database_chat_id"]),
                     "database_message_id": int(
-                        effective_database_message_id
+                        media["database_message_id"]
                     ),
                     "caption": media.get("caption"),
                 }

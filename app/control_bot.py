@@ -338,18 +338,36 @@ class ControlBot:
                 )
 
             elif mode == "database":
-                enabled = bool(
+                current_value = int(
                     settings.get("database_chat_enabled", 1)
                 )
+                new_value = 0 if current_value == 1 else 1
+
                 await self.db.update_settings(
-                    database_chat_enabled=0 if enabled else 1
+                    database_chat_enabled=new_value
                 )
 
+
             updated = await self.db.get_settings()
+
             if updated["service_enabled"]:
-                await self.runtime.restart()
+                if (
+                    mode == "database"
+                    and not updated.get("database_chat_active")
+                ):
+                    await self.db.update_settings(
+                        service_enabled=0
+                    )
+                    await self.runtime.stop()
+                else:
+                    await self.runtime.restart()
+
             context.user_data["state"] = f"chat_id:{mode}"
-            return await self.show_chat_manager(update, context, mode)
+            return await self.show_chat_manager(
+                update,
+                context,
+                mode,
+            )
 
         if action.startswith("disconnectchat:"):
             _, mode, raw_chat_id = action.split(":", 2)
