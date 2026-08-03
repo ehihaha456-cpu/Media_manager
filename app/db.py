@@ -107,7 +107,7 @@ async def get_chat_offset(self, chat_id: int) -> int | None:
     document = await self.chat_offsets.find_one(
         {"_id": str(int(chat_id))}
     )
-    if not document:
+    if document is None:
         return None
     return int(document.get("last_message_id", 0))
 
