@@ -143,6 +143,10 @@ class ControlBot:
     
         total = dashboard["total"]
         today = dashboard["today"]
+        pending = int(
+            dashboard.get("database_queue", 0)
+            + dashboard.get("destination_queue", 0)
+        )
     
         stats_block = (
             "<pre>"
@@ -155,7 +159,9 @@ class ControlBot:
             f"Duplicates {total['duplicates']:>6,}   "
             f"Duplicate {today['duplicates']:>7,}\n"
             f"Failed     {total['failed']:>7,}   "
-            f"Failed    {today['failed']:>7,}"
+            f"Failed    {today['failed']:>7,}\n"
+            f"Pending    {pending:>7,}   "
+            f"Pending   {pending:>7,}"
             "</pre>"
         )
     
@@ -184,12 +190,6 @@ class ControlBot:
             "━━━━━━━━━━━━━━━━━━━━\n\n"
             "📊 <b>Statistics</b>\n\n"
             f"{stats_block}\n\n"
-            "━━━━━━━━━━━━━━━━━━━━\n\n"
-            "📦 <b>Queue</b>\n"
-            f"• Database Queue      : "
-            f"{dashboard['database_queue']:,}\n"
-            f"• Destination Queue   : "
-            f"{dashboard['destination_queue']:,}\n\n"
             "━━━━━━━━━━━━━━━━━━━━\n\n"
             f"🧹 <b>Duplicate Delete</b> : "
             f"{duplicate_line}\n"
