@@ -29,6 +29,7 @@ NEW_MEDIA_GROUP_WINDOW = 3
 HISTORY_PAGE_SIZE = 100
 HISTORY_MEDIA_BATCH_SIZE = 10
 HISTORY_PROGRESS_EVERY = 100
+DATABASE_SELF_UPLOAD_GRACE_SECONDS = 15
 UPLOAD_FLOOD_RETRIES = 3
 ENTITY_CACHE_LIMIT = 256
 
@@ -713,6 +714,29 @@ class MediaRuntime:
                     message_id,
                 )
                 continue
+
+            # A Source -> Database upload may become visible in Telegram
+            # slightly before its MongoDB media record is committed. Do not
+            # classify a very recent Database message as a manual upload yet.
+            # Leaving the offset unchanged makes the next poll re-check it.
+            message_date = getattr(message, "date", None)
+            if message_date is not None:
+                if message_date.tzinfo is None:
+                    message_date = message_date.replace(
+                        tzinfo=timezone.utc
+                    )
+                age_seconds = (
+                    datetime.now(timezone.utc) - message_date
+                ).total_seconds()
+                if age_seconds < DATABASE_SELF_UPLOAD_GRACE_SECONDS:
+                    log.debug(
+                        "Deferring recent Database media ownership check: "
+                        "chat=%s message=%s age=%.1fs",
+                        chat_id,
+                        message_id,
+                        age_seconds,
+                    )
+                    continue
 
             # Permanent fallback: once MongoDB registration completes, the
             # Database message ID also identifies runtime-owned media.
