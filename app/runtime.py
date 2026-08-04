@@ -803,6 +803,24 @@ class MediaRuntime:
                     )
                     continue
 
+            # Permanent ownership ledger is independent of the media hash
+            # index. This is essential when a bot-uploaded message is itself
+            # a duplicate and therefore is not inserted as the canonical
+            # media record.
+            message_origin = await self.db.get_database_message_origin(
+                chat_id,
+                message_id,
+            )
+            if message_origin == "bot":
+                await self.db.set_chat_offset(chat_id, message_id)
+                log.debug(
+                    "Silently skipping bot-owned Database message: "
+                    "chat=%s message=%s",
+                    chat_id,
+                    message_id,
+                )
+                continue
+
             # Skip media uploaded by this runtime from a Source chat.
             # The message ID is marked immediately after Telegram confirms
             # the Database upload and before MongoDB registration begins.
@@ -1634,6 +1652,16 @@ class MediaRuntime:
                     )
 
                 self._mark_self_uploaded_database_message(int(sent.id))
+
+                # Save ownership immediately, before hash registration.
+                # Even if the hash is duplicate and register_database_media()
+                # returns the existing canonical record, this exact Telegram
+                # message remains permanently identifiable as bot-owned.
+                await self.db.mark_database_message_origin(
+                    database_chat_id,
+                    int(sent.id),
+                    "bot",
+                )
 
                 inserted, record = await self.db.register_database_media(
                     sha256=digest,

@@ -53,6 +53,7 @@ class Database:
         self.chat_offsets = self.database["chat_offsets"]
         self.activity_stats = self.database["activity_stats"]
         self.source_history_scans = self.database["source_history_scans"]
+        self.database_message_origins = self.database["database_message_origins"]
         self.runtime_locks = self.database["runtime_locks"]
 
     async def initialize(self) -> None:
@@ -343,6 +344,53 @@ class Database:
     async def find_by_hash(self, sha256: str) -> dict | None:
         document = await self.media.find_one({"sha256": sha256})
         return dict(document) if document else None
+
+    async def mark_database_message_origin(
+        self,
+        database_chat_id: int,
+        database_message_id: int,
+        origin: str,
+    ) -> None:
+        normalized_origin = (
+            "bot" if str(origin).lower() == "bot" else "manual"
+        )
+        key = (
+            f"{int(database_chat_id)}:"
+            f"{int(database_message_id)}"
+        )
+        await self.database_message_origins.update_one(
+            {"_id": key},
+            {
+                "$set": {
+                    "database_chat_id": int(database_chat_id),
+                    "database_message_id": int(database_message_id),
+                    "origin": normalized_origin,
+                    "updated_at": now(),
+                },
+                "$setOnInsert": {
+                    "created_at": now(),
+                },
+            },
+            upsert=True,
+        )
+
+    async def get_database_message_origin(
+        self,
+        database_chat_id: int,
+        database_message_id: int,
+    ) -> str | None:
+        key = (
+            f"{int(database_chat_id)}:"
+            f"{int(database_message_id)}"
+        )
+        document = await self.database_message_origins.find_one(
+            {"_id": key},
+            {"origin": 1},
+        )
+        if not document:
+            return None
+        origin = str(document.get("origin") or "").lower()
+        return origin if origin in {"bot", "manual"} else None
 
     async def find_by_database_message(
         self,
