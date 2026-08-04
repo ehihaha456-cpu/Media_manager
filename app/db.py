@@ -54,6 +54,7 @@ class Database:
         self.activity_stats = self.database["activity_stats"]
         self.source_history_scans = self.database["source_history_scans"]
         self.database_message_origins = self.database["database_message_origins"]
+        self.database_upload_tokens = self.database["database_upload_tokens"]
         self.runtime_locks = self.database["runtime_locks"]
 
     async def initialize(self) -> None:
@@ -344,6 +345,79 @@ class Database:
     async def find_by_hash(self, sha256: str) -> dict | None:
         document = await self.media.find_one({"sha256": sha256})
         return dict(document) if document else None
+
+    async def create_database_upload_token(
+        self,
+        token: str,
+        database_chat_id: int,
+        source_chat_id: int,
+        source_message_id: int,
+    ) -> None:
+        await self.database_upload_tokens.update_one(
+            {"_id": str(token)},
+            {
+                "$set": {
+                    "database_chat_id": int(database_chat_id),
+                    "source_chat_id": int(source_chat_id),
+                    "source_message_id": int(source_message_id),
+                    "status": "pending",
+                    "updated_at": now(),
+                },
+                "$setOnInsert": {
+                    "created_at": now(),
+                    "database_message_id": None,
+                },
+            },
+            upsert=True,
+        )
+
+    async def bind_database_upload_token(
+        self,
+        token: str,
+        database_chat_id: int,
+        database_message_id: int,
+    ) -> bool:
+        document = await self.database_upload_tokens.find_one_and_update(
+            {
+                "_id": str(token),
+                "database_chat_id": int(database_chat_id),
+                "$or": [
+                    {"database_message_id": None},
+                    {"database_message_id": int(database_message_id)},
+                ],
+            },
+            {
+                "$set": {
+                    "database_message_id": int(database_message_id),
+                    "status": "bound",
+                    "updated_at": now(),
+                }
+            },
+            return_document=ReturnDocument.AFTER,
+        )
+        return bool(
+            document
+            and int(document.get("database_message_id") or 0)
+            == int(database_message_id)
+        )
+
+    async def claim_database_upload_token(
+        self,
+        token: str,
+        database_chat_id: int,
+        database_message_id: int,
+    ) -> bool:
+        return await self.bind_database_upload_token(
+            token,
+            database_chat_id,
+            database_message_id,
+        )
+
+    async def delete_database_upload_token(
+        self,
+        token: str,
+    ) -> None:
+        await self.database_upload_tokens.delete_one({"_id": str(token)})
 
     async def mark_database_message_origin(
         self,

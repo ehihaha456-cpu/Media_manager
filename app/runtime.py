@@ -31,6 +31,11 @@ HISTORY_MEDIA_BATCH_SIZE = 10
 HISTORY_PROGRESS_EVERY = 100
 DATABASE_SELF_UPLOAD_GRACE_SECONDS = 15
 DATABASE_SELF_UPLOAD_MARKER = "\u2063"
+DATABASE_UPLOAD_TOKEN_PREFIX = "\u2063\u2063"
+DATABASE_UPLOAD_TOKEN_SUFFIX = "\u2063\u2063"
+DATABASE_UPLOAD_TOKEN_ZERO = "\u200b"
+DATABASE_UPLOAD_TOKEN_ONE = "\u200c"
+DATABASE_UPLOAD_TOKEN_BITS = 128
 UPLOAD_FLOOD_RETRIES = 3
 ENTITY_CACHE_LIMIT = 256
 
@@ -776,6 +781,38 @@ class MediaRuntime:
                 await self.db.set_chat_offset(chat_id, message_id)
                 continue
     
+            # Cross-process ownership token: created before Telegram upload.
+            # The first exact Database message that claims this token is the
+            # runtime-owned upload and must never produce owner notifications.
+            message_text = str(getattr(message, "message", None) or "")
+            upload_token, clean_caption = self._decode_database_upload_token(
+                message_text
+            )
+            if upload_token:
+                claimed = await self.db.claim_database_upload_token(
+                    upload_token,
+                    chat_id,
+                    message_id,
+                )
+                if claimed:
+                    await self.db.mark_database_message_origin(
+                        chat_id,
+                        message_id,
+                        "bot",
+                    )
+                    await self._clear_database_upload_marker(
+                        chat_id,
+                        message,
+                    )
+                    await self.db.set_chat_offset(chat_id, message_id)
+                    log.debug(
+                        "Silently claimed runtime Database upload: "
+                        "chat=%s message=%s",
+                        chat_id,
+                        message_id,
+                    )
+                    continue
+
             # The invisible marker is temporary. Only the exact Database
             # message already registered by this runtime is silently skipped.
             # A copied/forwarded marked message has a different message ID and
@@ -1472,12 +1509,65 @@ class MediaRuntime:
                 await asyncio.sleep(wait_seconds)
 
     @staticmethod
-    def _database_upload_caption(
+    def _encode_database_upload_token(token: str) -> str:
+        raw = bytes.fromhex(str(token).replace("-", ""))
+        bits = "".join(f"{byte:08b}" for byte in raw)
+        encoded = "".join(
+            DATABASE_UPLOAD_TOKEN_ONE if bit == "1"
+            else DATABASE_UPLOAD_TOKEN_ZERO
+            for bit in bits
+        )
+        return (
+            DATABASE_UPLOAD_TOKEN_PREFIX
+            + encoded
+            + DATABASE_UPLOAD_TOKEN_SUFFIX
+        )
+
+    @staticmethod
+    def _decode_database_upload_token(
         caption: str | None,
+    ) -> tuple[str | None, str]:
+        text = str(caption or "")
+        prefix = DATABASE_UPLOAD_TOKEN_PREFIX
+        suffix = DATABASE_UPLOAD_TOKEN_SUFFIX
+        if not text.startswith(prefix):
+            return None, text
+
+        start = len(prefix)
+        end = start + DATABASE_UPLOAD_TOKEN_BITS
+        if len(text) < end + len(suffix):
+            return None, text
+        if text[end:end + len(suffix)] != suffix:
+            return None, text
+
+        encoded = text[start:end]
+        if any(
+            char not in {
+                DATABASE_UPLOAD_TOKEN_ZERO,
+                DATABASE_UPLOAD_TOKEN_ONE,
+            }
+            for char in encoded
+        ):
+            return None, text
+
+        bits = "".join(
+            "1" if char == DATABASE_UPLOAD_TOKEN_ONE else "0"
+            for char in encoded
+        )
+        token = "".join(
+            f"{int(bits[index:index + 8], 2):02x}"
+            for index in range(0, len(bits), 8)
+        )
+        clean = text[end + len(suffix):]
+        return token, clean
+
+    @classmethod
+    def _database_upload_caption(
+        cls,
+        caption: str | None,
+        token: str,
     ) -> str:
-        # Temporary invisible marker closes the Telegram/MongoDB registration
-        # race. It is removed immediately after successful registration.
-        return DATABASE_SELF_UPLOAD_MARKER + (caption or "")
+        return cls._encode_database_upload_token(token) + (caption or "")
 
     async def _clear_database_upload_marker(
         self,
@@ -1487,10 +1577,11 @@ class MediaRuntime:
         current_caption = str(
             getattr(message, "message", None) or ""
         )
-        if not current_caption.startswith(DATABASE_SELF_UPLOAD_MARKER):
+        token, clean_caption = self._decode_database_upload_token(
+            current_caption
+        )
+        if not token:
             return
-
-        clean_caption = current_caption[len(DATABASE_SELF_UPLOAD_MARKER):]
         try:
             target = await self._resolve_peer(database_chat_id)
             await self.client.edit_message(
@@ -1614,14 +1705,24 @@ class MediaRuntime:
                 # its own servers. Run that copy in parallel with the local
                 # download/hash needed for duplicate detection. Restricted
                 # media automatically falls back to the original upload path.
+                upload_token = uuid4().hex
+                await self.db.create_database_upload_token(
+                    upload_token,
+                    database_chat_id,
+                    source_chat_id,
+                    int(message.id),
+                )
+                upload_caption = self._database_upload_caption(
+                    message.message or None,
+                    upload_token,
+                )
+
                 fast_copy_task = asyncio.create_task(
                     self._try_server_side_copy(
                         database_chat_id,
                         message,
                         kind,
-                        self._database_upload_caption(
-                            message.message or None
-                        ),
+                        upload_caption,
                     )
                 )
 
@@ -1646,11 +1747,14 @@ class MediaRuntime:
                         path,
                         message,
                         kind,
-                        self._database_upload_caption(
-                            message.message or None
-                        ),
+                        upload_caption,
                     )
 
+                await self.db.bind_database_upload_token(
+                    upload_token,
+                    database_chat_id,
+                    int(sent.id),
+                )
                 self._mark_self_uploaded_database_message(int(sent.id))
 
                 # Save ownership immediately, before hash registration.
@@ -1675,11 +1779,10 @@ class MediaRuntime:
                     origin="bot",
                 )
 
-                if inserted:
-                    await self._clear_database_upload_marker(
-                        database_chat_id,
-                        sent,
-                    )
+                await self._clear_database_upload_marker(
+                    database_chat_id,
+                    sent,
+                )
 
                 if not inserted:
                     original_chat_id = int(
