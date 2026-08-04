@@ -1702,10 +1702,93 @@ class MediaRuntime:
 
         async with self.processing_lock:
             try:
-                # For normal chats, Telegram can copy the existing media on
-                # its own servers. Run that copy in parallel with the local
-                # download/hash needed for duplicate detection. Restricted
-                # media automatically falls back to the original upload path.
+                # Download and hash first. Duplicate detection must finish
+                # before any Source -> Database upload starts.
+                downloaded = await message.download_media(file=str(temp))
+                if not downloaded:
+                    raise RuntimeError(
+                        "Source media download returned no file"
+                    )
+
+                path = Path(downloaded)
+                digest = await asyncio.to_thread(sha256_file, path)
+
+                existing = await self.db.find_by_hash(digest)
+                if existing:
+                    original_chat_id = int(
+                        existing.get("database_chat_id")
+                        or existing.get("source_chat_id")
+                    )
+                    original_message_id = int(
+                        existing.get("database_message_id")
+                        or existing.get("source_message_id")
+                    )
+
+                    original_message = None
+                    try:
+                        original_message = await self.client.get_messages(
+                            original_chat_id,
+                            ids=original_message_id,
+                        )
+                    except Exception:
+                        log.exception(
+                            "Original duplicate candidate could not be fetched: "
+                            "chat=%s message=%s",
+                            original_chat_id,
+                            original_message_id,
+                        )
+
+                    if original_message and media_kind(original_message):
+                        original_link = await self._message_link(
+                            original_chat_id,
+                            original_message_id,
+                        )
+                        duplicate_link = await self._message_link(
+                            source_chat_id,
+                            int(message.id),
+                        )
+                        file_index = self.pending_notifications[
+                            notification_key
+                        ]["file_results"][int(message.id)]["index"]
+
+                        await self._update_notification_result(
+                            notification_key,
+                            duplicate=1,
+                            processed=1,
+                            duplicate_pair={
+                                "index": file_index,
+                                "original_link": original_link,
+                                "duplicate_link": duplicate_link,
+                                "original_chat_id": original_chat_id,
+                                "original_message_id": original_message_id,
+                                "duplicate_chat_id": source_chat_id,
+                                "duplicate_message_id": int(message.id),
+                            },
+                            file_result={
+                                "message_id": int(message.id),
+                                "status": "duplicate",
+                                "source_link": duplicate_link,
+                            },
+                        )
+                        log.info(
+                            "Source duplicate detected before Database upload: "
+                            "source=%s/%s original=%s/%s",
+                            source_chat_id,
+                            message.id,
+                            original_chat_id,
+                            original_message_id,
+                        )
+                        return True
+
+                    # The hash record points to media that no longer exists.
+                    # Remove it and allow this Source media to become the new
+                    # canonical Database original.
+                    await self.db.media.delete_one(
+                        {"_id": existing["_id"]}
+                    )
+
+                # Unique media (or stale original replacement) can now be
+                # copied/uploaded to Database and marked as bot-owned.
                 upload_token = uuid4().hex
                 await self.db.create_database_upload_token(
                     upload_token,
@@ -1718,30 +1801,12 @@ class MediaRuntime:
                     upload_token,
                 )
 
-                fast_copy_task = asyncio.create_task(
-                    self._try_server_side_copy(
-                        database_chat_id,
-                        message,
-                        kind,
-                        upload_caption,
-                    )
+                sent = await self._try_server_side_copy(
+                    database_chat_id,
+                    message,
+                    kind,
+                    upload_caption,
                 )
-
-                downloaded = await message.download_media(file=str(temp))
-                if not downloaded:
-                    fast_copy_task.cancel()
-                    await asyncio.gather(
-                        fast_copy_task,
-                        return_exceptions=True,
-                    )
-                    raise RuntimeError(
-                        "Source media download returned no file"
-                    )
-
-                path = Path(downloaded)
-                digest = await asyncio.to_thread(sha256_file, path)
-
-                sent = await fast_copy_task
                 if sent is None:
                     sent = await self._upload_downloaded_media(
                         database_chat_id,
