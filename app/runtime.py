@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from datetime import datetime, timezone
+from html import escape
 from collections import defaultdict
 from pathlib import Path
 from uuid import uuid4
@@ -2035,10 +2036,28 @@ class MediaRuntime:
         file_results = {}
         for index, message in enumerate(messages, start=1):
             message_id = int(message.id)
+            telegram_file = getattr(message, "file", None)
+            raw_name = getattr(telegram_file, "name", None)
+            raw_size = getattr(telegram_file, "size", None)
+
+            if not raw_name:
+                extension = {
+                    "video": "mp4",
+                    "photo": "jpg",
+                    "audio": "mp3",
+                    "file": "bin",
+                }.get(media_kind(message) or "file", "bin")
+                raw_name = (
+                    f"{media_kind(message) or 'file'}_"
+                    f"{message_id}.{extension}"
+                )
+
             file_results[message_id] = {
                 "index": index,
                 "message_id": message_id,
                 "kind": media_kind(message) or "file",
+                "file_name": str(raw_name),
+                "file_size": int(raw_size or 0),
                 "status": "processing",
                 "source_link": await self._message_link(
                     int(source_chat_id),
@@ -2238,6 +2257,51 @@ class MediaRuntime:
             return f'<a href="{link}">{label}</a>'
         return label
 
+    @staticmethod
+    def _format_file_size(size: int | None) -> str:
+        value = max(0, int(size or 0))
+        units = ("B", "KB", "MB", "GB", "TB")
+        amount = float(value)
+
+        for unit in units:
+            if amount < 1024 or unit == units[-1]:
+                if unit == "B":
+                    return f"{int(amount)} {unit}"
+                return f"{amount:.1f} {unit}"
+            amount /= 1024
+
+        return f"{value} B"
+
+    def _file_detail_line(
+        self,
+        item: dict | None,
+        index: int,
+    ) -> str:
+        item = item or {}
+        raw_name = str(
+            item.get("file_name")
+            or f"media_{index}"
+        )
+        # Keep Telegram owner messages readable and under 4096 chars.
+        if len(raw_name) > 64:
+            raw_name = raw_name[:61] + "..."
+
+        name = escape(raw_name)
+        size = self._format_file_size(
+            item.get("file_size")
+        )
+        return f"File {index}: {name} • {size}"
+
+    def _file_result_by_index(
+        self,
+        bucket: dict,
+        index: int,
+    ) -> dict:
+        for item in bucket.get("file_results", {}).values():
+            if int(item.get("index", 0)) == int(index):
+                return item
+        return {}
+
     def _processing_file_lines(self, bucket: dict) -> list[str]:
         lines: list[str] = []
         items = sorted(
@@ -2258,8 +2322,11 @@ class MediaRuntime:
                 "failed": "❌",
                 "processing": "⏳",
             }.get(status, "⏳")
+
             lines.append(
-                f"File {index}: {source_text} {icon}"
+                self._file_detail_line(item, index)
+                + "\n"
+                + f"{source_text} {icon}"
             )
 
         return lines
@@ -2298,6 +2365,7 @@ class MediaRuntime:
             chat_id=self.owner_id,
             text=text,
             parse_mode="HTML",
+            disable_web_page_preview=True,
         )
         bucket["message_id"] = int(sent.message_id)
 
@@ -2399,9 +2467,15 @@ class MediaRuntime:
                     pair.get("database_link"),
                     "🗄 Database Media",
                 )
+                item = self._file_result_by_index(
+                    bucket,
+                    index,
+                )
                 final_text += (
-                    f"\nFile {index}: "
-                    f"{source_text}    {database_text} ✅"
+                    "\n\n"
+                    + self._file_detail_line(item, index)
+                    + "\n"
+                    + f"{source_text}    {database_text} ✅"
                 )
 
             if len(processed_pairs) > 20:
@@ -2447,9 +2521,15 @@ class MediaRuntime:
                     )
                 )
 
+                item = self._file_result_by_index(
+                    bucket,
+                    index,
+                )
                 final_text += (
-                    f"\nFile {index}: "
-                    f"{original_text}    {duplicate_text}"
+                    "\n\n"
+                    + self._file_detail_line(item, index)
+                    + "\n"
+                    + f"{original_text}    {duplicate_text}"
                 )
 
             if len(duplicate_pairs) > 20:
