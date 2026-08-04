@@ -371,6 +371,7 @@ class Database:
         caption: str | None,
         source_chat_id: int | None = None,
         source_message_id: int | None = None,
+        origin: str = "manual",
     ) -> tuple[bool, dict]:
         media_id = await self._next_id("media")
         document = {
@@ -392,6 +393,7 @@ class Database:
             "database_chat_id": int(database_chat_id),
             "database_message_id": int(database_message_id),
             "caption": caption,
+            "origin": "bot" if str(origin).lower() == "bot" else "manual",
             "created_at": now(),
         }
         try:

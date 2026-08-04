@@ -237,6 +237,32 @@ class MediaRuntime:
             files=0,
         )
 
+        try:
+            chat_name = str(chat_id)
+            if self.client and self.client.is_connected():
+                entity = await self.client.get_entity(chat_id)
+                chat_name = (
+                    getattr(entity, "title", None)
+                    or getattr(entity, "username", None)
+                    or str(chat_id)
+                )
+            await self.alert_bot.send_message(
+                chat_id=self.owner_id,
+                text=(
+                    "🔎 <b>Source Full History Scan</b>\n\n"
+                    f"Source: <b>{chat_name}</b>\n"
+                    f"Chat ID: <code>{chat_id}</code>\n\n"
+                    "Status: Counting media...\n"
+                    "Order: Oldest → Newest"
+                ),
+                parse_mode="HTML",
+            )
+        except Exception:
+            log.exception(
+                "Could not send immediate source history notification: %s",
+                chat_id,
+            )
+
         if self.running and self.client and self.client.is_connected():
             self._start_source_history_task(chat_id)
 
@@ -339,7 +365,7 @@ class MediaRuntime:
         await self.alert_bot.send_message(
             chat_id=self.owner_id,
             text=(
-                "🔎 <b>Source Full History Scan</b>\n\n"
+                "📊 <b>Source History Count Complete</b>\n\n"
                 f"Source: <b>{chat_name}</b>\n"
                 f"Chat ID: <code>{chat_id}</code>\n\n"
                 + ("\n".join(media_lines) or "No media found")
@@ -659,6 +685,54 @@ class MediaRuntime:
             keep = sorted(self.self_uploaded_database_ids)[-2500:]
             self.self_uploaded_database_ids = set(keep)
 
+    async def _silently_verify_bot_database_message(
+        self,
+        chat_id: int,
+        message,
+        record: dict,
+    ) -> None:
+        """Verify a runtime-owned Database upload without owner messages."""
+        temp = self.temp_dir / f"database_verify_{uuid4().hex}"
+        try:
+            downloaded = await message.download_media(file=str(temp))
+            if not downloaded:
+                raise RuntimeError("Silent Database verification download failed")
+            path = Path(downloaded)
+            digest = await asyncio.to_thread(sha256_file, path)
+            expected = str(record.get("sha256") or "")
+            if expected and digest != expected:
+                log.warning(
+                    "Runtime-owned Database media hash mismatch: chat=%s message=%s",
+                    chat_id,
+                    int(message.id),
+                )
+            else:
+                log.debug(
+                    "Runtime-owned Database media silently verified: chat=%s message=%s",
+                    chat_id,
+                    int(message.id),
+                )
+        except Exception:
+            log.exception(
+                "Silent runtime-owned Database verification failed: chat=%s message=%s",
+                chat_id,
+                int(message.id),
+            )
+        finally:
+            for candidate in (
+                temp,
+                Path(str(temp) + ".mp4"),
+                Path(str(temp) + ".jpg"),
+                Path(str(temp) + ".jpeg"),
+                Path(str(temp) + ".png"),
+                Path(str(temp) + ".webm"),
+                Path(str(temp) + ".mkv"),
+            ):
+                try:
+                    candidate.unlink(missing_ok=True)
+                except Exception:
+                    pass
+
     async def _poll_database_chat(
         self,
         chat_id: int,
@@ -766,13 +840,35 @@ class MediaRuntime:
                     )
                     continue
 
-            # Permanent fallback: once MongoDB registration completes, the
-            # Database message ID also identifies runtime-owned media.
+            # Exact Database message ownership is permanent in MongoDB.
+            # Runtime-owned uploads are still hash-verified, but completely
+            # silently. Owner/manual uploads continue to the notification path.
             existing_message = await self.db.find_by_database_message(
                 chat_id,
                 message_id,
             )
             if existing_message:
+                origin = str(existing_message.get("origin") or "").lower()
+                if not origin:
+                    source_chat = existing_message.get("source_chat_id")
+                    origin = (
+                        "bot"
+                        if source_chat is not None
+                        and int(source_chat) != int(chat_id)
+                        else "manual"
+                    )
+
+                if origin == "bot":
+                    await self._silently_verify_bot_database_message(
+                        chat_id,
+                        message,
+                        existing_message,
+                    )
+                    await self.db.set_chat_offset(chat_id, message_id)
+                    continue
+
+                # A manual message already registered as the canonical
+                # original does not need another notification on restart.
                 await self.db.set_chat_offset(chat_id, message_id)
                 continue
     
@@ -932,6 +1028,7 @@ class MediaRuntime:
                                 caption=message.message or None,
                                 source_chat_id=database_chat_id,
                                 source_message_id=int(message.id),
+                                origin="manual",
                             )
                         )
                         if not inserted:
@@ -1015,6 +1112,7 @@ class MediaRuntime:
                     caption=message.message or None,
                     source_chat_id=database_chat_id,
                     source_message_id=int(message.id),
+                    origin="manual",
                 )
                 if not inserted:
                     raise RuntimeError(
@@ -1546,6 +1644,7 @@ class MediaRuntime:
                     caption=message.message or None,
                     source_chat_id=source_chat_id,
                     source_message_id=int(message.id),
+                    origin="bot",
                 )
 
                 if inserted:
