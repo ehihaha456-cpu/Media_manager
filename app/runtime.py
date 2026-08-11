@@ -1420,6 +1420,62 @@ class MediaRuntime:
             )
             return None
 
+    async def _generate_video_thumbnail(
+        self,
+        video_path: Path,
+    ) -> Path | None:
+        """Generate a Telegram-compatible fallback thumbnail with FFmpeg."""
+        thumb_path = Path(str(video_path) + "_generated_thumb.jpg")
+        try:
+            process = await asyncio.create_subprocess_exec(
+                "ffmpeg",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-ss",
+                "1",
+                "-i",
+                str(video_path),
+                "-frames:v",
+                "1",
+                "-vf",
+                "scale=320:320:force_original_aspect_ratio=decrease",
+                "-q:v",
+                "4",
+                str(thumb_path),
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            _, stderr = await process.communicate()
+            if (
+                process.returncode == 0
+                and thumb_path.exists()
+                and thumb_path.stat().st_size > 0
+            ):
+                return thumb_path
+
+            log.warning(
+                "FFmpeg thumbnail fallback failed for %s: %s",
+                video_path,
+                (stderr or b"").decode(
+                    "utf-8",
+                    errors="replace",
+                )[-500:],
+            )
+        except FileNotFoundError:
+            log.warning(
+                "FFmpeg is unavailable; video thumbnail fallback skipped"
+            )
+        except Exception:
+            log.exception(
+                "Could not generate fallback video thumbnail: %s",
+                video_path,
+            )
+
+        thumb_path.unlink(missing_ok=True)
+        return None
+
     async def _resolve_peer(
         self,
         chat_id: int,
@@ -1656,10 +1712,15 @@ class MediaRuntime:
 
         try:
             if kind == "video":
+                # Preserve Telegram's original thumbnail first. If Telegram
+                # does not expose one (seen with some large re-uploads),
+                # generate a JPEG preview from the downloaded video.
                 thumb_path = await self._download_media_thumbnail(
                     source_message,
                     path,
                 )
+                if thumb_path is None:
+                    thumb_path = await self._generate_video_thumbnail(path)
 
             kwargs = {
                 "caption": caption,
