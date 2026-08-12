@@ -8,6 +8,8 @@ from collections import defaultdict
 from pathlib import Path
 from uuid import uuid4
 
+from PIL import Image
+
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from telegram import Bot
 from telethon import TelegramClient
@@ -67,6 +69,251 @@ class MediaRuntime:
         self.source_history_tasks: dict[int, asyncio.Task] = {}
         self.entity_cache: dict[int, object] = {}
         self.self_uploaded_database_ids: set[int] = set()
+        self.reverse_index_task: asyncio.Task | None = None
+
+    @staticmethod
+    def _dhash_image(path: Path) -> str:
+        with Image.open(path) as image:
+            image = image.convert("L").resize((9, 8))
+            pixels = list(image.getdata())
+        value = 0
+        bit = 0
+        for y in range(8):
+            row = y * 9
+            for x in range(8):
+                if pixels[row + x] > pixels[row + x + 1]:
+                    value |= 1 << bit
+                bit += 1
+        return f"{value:016x}"
+
+    @staticmethod
+    def _hash_similarity(left: str, right: str) -> float:
+        try:
+            distance = (int(left, 16) ^ int(right, 16)).bit_count()
+        except Exception:
+            return 0.0
+        return max(0.0, 100.0 * (64 - distance) / 64)
+
+    async def _video_duration(self, path: Path) -> float:
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "ffprobe",
+                "-v", "error",
+                "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                str(path),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            stdout, _ = await proc.communicate()
+            return max(0.0, float((stdout or b"0").decode().strip() or 0))
+        except Exception:
+            return 0.0
+
+    async def _video_frame_hashes(self, path: Path, count: int = 8) -> list[str]:
+        duration = await self._video_duration(path)
+        rate = max(0.03, min(2.0, float(count) / max(duration, 1.0)))
+        frame_dir = self.temp_dir / f"reverse_frames_{uuid4().hex}"
+        frame_dir.mkdir(parents=True, exist_ok=True)
+        output = frame_dir / "frame_%03d.jpg"
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "ffmpeg",
+                "-hide_banner", "-loglevel", "error", "-y",
+                "-i", str(path),
+                "-vf", f"fps={rate},scale=480:-2",
+                "-frames:v", str(max(1, count)),
+                str(output),
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            _, stderr = await proc.communicate()
+            if proc.returncode != 0:
+                log.warning(
+                    "Reverse-search frame extraction failed: %s",
+                    (stderr or b"").decode("utf-8", errors="replace")[-500:],
+                )
+                return []
+            hashes = []
+            for frame in sorted(frame_dir.glob("frame_*.jpg")):
+                try:
+                    hashes.append(await asyncio.to_thread(self._dhash_image, frame))
+                except Exception:
+                    log.exception("Could not hash extracted frame: %s", frame)
+            return hashes
+        finally:
+            for frame in frame_dir.glob("*"):
+                frame.unlink(missing_ok=True)
+            try:
+                frame_dir.rmdir()
+            except OSError:
+                pass
+
+    async def _fingerprint_local_media(self, path: Path, kind: str) -> list[str]:
+        if kind == "photo":
+            try:
+                return [await asyncio.to_thread(self._dhash_image, path)]
+            except Exception:
+                log.exception("Could not fingerprint image: %s", path)
+                return []
+        if kind == "video":
+            return await self._video_frame_hashes(path, count=8)
+        return []
+
+    async def _index_local_database_media(
+        self,
+        *,
+        record: dict,
+        path: Path,
+        kind: str,
+        database_chat_id: int,
+        database_message_id: int,
+    ) -> None:
+        if kind not in {"video", "photo"}:
+            return
+        try:
+            hashes = await self._fingerprint_local_media(path, kind)
+            if not hashes:
+                return
+            await self.db.upsert_reverse_media_fingerprint(
+                media_id=int(record["id"]),
+                media_kind=kind,
+                database_chat_id=int(database_chat_id),
+                database_message_id=int(database_message_id),
+                frame_hashes=hashes,
+            )
+        except Exception:
+            log.exception(
+                "Automatic reverse-search indexing failed: %s/%s",
+                database_chat_id,
+                database_message_id,
+            )
+
+    async def start_reverse_index_build(self) -> bool:
+        if not self.running or not self.client:
+            return False
+        if self.reverse_index_task and not self.reverse_index_task.done():
+            return True
+        self.reverse_index_task = asyncio.create_task(
+            self._build_reverse_search_index(),
+            name="reverse-search-index",
+        )
+        return True
+
+    async def _build_reverse_search_index(self) -> None:
+        indexed_now = 0
+        failed = 0
+        try:
+            counts = await self.db.reverse_index_counts()
+            await self.alert_bot.send_message(
+                chat_id=self.owner_id,
+                text=(
+                    "🔎 <b>Search Index Started</b>\n\n"
+                    f"Indexed: <b>{counts['indexed']}</b>\n"
+                    f"Total Media: <b>{counts['total']}</b>\n\n"
+                    "Images and video keyframes are being fingerprinted."
+                ),
+                parse_mode="HTML",
+            )
+            while self.running:
+                rows = await self.db.unindexed_reverse_media(limit=20)
+                if not rows:
+                    break
+                for record in rows:
+                    chat_id = int(record.get("database_chat_id") or 0)
+                    message_id = int(record.get("database_message_id") or 0)
+                    kind = str(record.get("media_kind") or "")
+                    temp = self.temp_dir / f"reverse_index_{uuid4().hex}"
+                    try:
+                        message = await self.client.get_messages(chat_id, ids=message_id)
+                        if not message or not getattr(message, "media", None):
+                            failed += 1
+                            continue
+                        downloaded = await message.download_media(file=str(temp))
+                        if not downloaded:
+                            failed += 1
+                            continue
+                        local = Path(downloaded)
+                        hashes = await self._fingerprint_local_media(local, kind)
+                        if not hashes:
+                            failed += 1
+                            continue
+                        await self.db.upsert_reverse_media_fingerprint(
+                            media_id=int(record["id"]),
+                            media_kind=kind,
+                            database_chat_id=chat_id,
+                            database_message_id=message_id,
+                            frame_hashes=hashes,
+                        )
+                        indexed_now += 1
+                        if indexed_now % 50 == 0:
+                            current = await self.db.reverse_index_counts()
+                            await self.alert_bot.send_message(
+                                chat_id=self.owner_id,
+                                text=(
+                                    "⏳ <b>Search Index Progress</b>\n\n"
+                                    f"Indexed: <b>{current['indexed']} / {current['total']}</b>\n"
+                                    f"Failed/Unavailable: <b>{failed}</b>"
+                                ),
+                                parse_mode="HTML",
+                            )
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        failed += 1
+                        log.exception(
+                            "Could not index Database media: %s/%s",
+                            chat_id,
+                            message_id,
+                        )
+                    finally:
+                        Path(temp).unlink(missing_ok=True)
+            final = await self.db.reverse_index_counts()
+            await self.alert_bot.send_message(
+                chat_id=self.owner_id,
+                text=(
+                    "✅ <b>Search Index Complete</b>\n\n"
+                    f"Indexed: <b>{final['indexed']} / {final['total']}</b>\n"
+                    f"Failed/Unavailable: <b>{failed}</b>"
+                ),
+                parse_mode="HTML",
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("Reverse-search index build failed")
+        finally:
+            self.reverse_index_task = None
+
+    async def reverse_search_file(self, path: Path, kind: str) -> list[dict]:
+        query_hashes = await self._fingerprint_local_media(path, kind)
+        if not query_hashes:
+            return []
+        candidates = await self.db.all_reverse_fingerprints()
+        results: list[dict] = []
+        for candidate in candidates:
+            stored = [str(x) for x in candidate.get("frame_hashes", []) if x]
+            if not stored:
+                continue
+            per_query = []
+            for query_hash in query_hashes:
+                per_query.append(max(
+                    self._hash_similarity(query_hash, stored_hash)
+                    for stored_hash in stored
+                ))
+            if not per_query:
+                continue
+            # A screenshot only has one frame. For clips, average the best
+            # visual correspondence for each sampled query frame.
+            score = sum(per_query) / len(per_query)
+            results.append({
+                "score": round(score, 1),
+                "database_chat_id": int(candidate["database_chat_id"]),
+                "database_message_id": int(candidate["database_message_id"]),
+                "media_kind": candidate.get("media_kind"),
+            })
+        results.sort(key=lambda row: row["score"], reverse=True)
+        return results[:3]
 
     async def start(self) -> None:
         settings = await self.db.get_settings()
@@ -145,6 +392,14 @@ class MediaRuntime:
 
     async def stop(self) -> None:
         self.running = False
+
+        if self.reverse_index_task and not self.reverse_index_task.done():
+            self.reverse_index_task.cancel()
+            await asyncio.gather(
+                self.reverse_index_task,
+                return_exceptions=True,
+            )
+        self.reverse_index_task = None
 
         for task in self.source_history_tasks.values():
             task.cancel()
@@ -1091,6 +1346,13 @@ class MediaRuntime:
                             raise RuntimeError(
                                 "Could not replace stale media record"
                             )
+                        await self._index_local_database_media(
+                            record=record,
+                            path=path,
+                            kind=kind,
+                            database_chat_id=database_chat_id,
+                            database_message_id=int(message.id),
+                        )
                         current_link = await self._message_link(
                             database_chat_id,
                             int(message.id),
@@ -1174,6 +1436,13 @@ class MediaRuntime:
                     raise RuntimeError(
                         "Database media registration race detected"
                     )
+                await self._index_local_database_media(
+                    record=record,
+                    path=path,
+                    kind=kind,
+                    database_chat_id=database_chat_id,
+                    database_message_id=int(message.id),
+                )
                 current_link = await self._message_link(
                     database_chat_id,
                     int(message.id),
@@ -1906,6 +2175,15 @@ class MediaRuntime:
                     origin="bot",
                 )
 
+                if inserted:
+                    await self._index_local_database_media(
+                        record=record,
+                        path=path,
+                        kind=kind,
+                        database_chat_id=database_chat_id,
+                        database_message_id=int(sent.id),
+                    )
+
                 await self._clear_database_upload_marker(
                     database_chat_id,
                     sent,
@@ -1966,6 +2244,14 @@ class MediaRuntime:
                             raise RuntimeError(
                                 "Stale duplicate record could not be replaced"
                             )
+
+                        await self._index_local_database_media(
+                            record=fresh_record,
+                            path=path,
+                            kind=kind,
+                            database_chat_id=database_chat_id,
+                            database_message_id=int(sent.id),
+                        )
 
                         for destination in settings["active_destination_chat_ids"]:
                             destination_id = int(destination)

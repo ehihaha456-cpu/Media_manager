@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import logging
 import re
+from pathlib import Path
+from uuid import uuid4
 from telethon import TelegramClient
 from telethon.errors import SessionPasswordNeededError, PhoneCodeInvalidError
 from telethon.sessions import StringSession
@@ -38,6 +40,7 @@ def main_keyboard(connected: bool):
             ("🗄 Database Chat", "database"),
         ],
         [("📤 Destination Chats", "destination")],
+        [("🔎 Find Original Media", "find_original")],
         [
             ("🧹 Duplicate Settings", "duplicates"),
             ("⏰ Scheduler", "scheduler"),
@@ -522,6 +525,39 @@ class ControlBot:
                 reply_markup=keyboard([[("⬅️ Back", "back")]]),
             )
 
+        if action == "find_original":
+            context.user_data["state"] = "find_original"
+            counts = await self.db.reverse_index_counts()
+            return await q.edit_message_text(
+                "🔎 <b>Find Original Media</b>\n\n"
+                "Send a screenshot/photo or a short cut video.\n"
+                "I will compare it with the Database search index.\n\n"
+                f"Indexed: <b>{counts['indexed']} / {counts['total']}</b>\n\n"
+                "For best results, build the search index after your Database history upload is complete.",
+                parse_mode="HTML",
+                reply_markup=keyboard([
+                    [("🧠 Build / Continue Search Index", "build_search_index")],
+                    [("⬅️ Back", "back")],
+                ]),
+            )
+
+        if action == "build_search_index":
+            started = await self.runtime.start_reverse_index_build()
+            if not started:
+                return await q.answer(
+                    "Start the Media Manager service first.",
+                    show_alert=True,
+                )
+            await q.answer("Search indexing started ✅", show_alert=False)
+            counts = await self.db.reverse_index_counts()
+            return await q.edit_message_text(
+                "🧠 <b>Search Index Running</b>\n\n"
+                f"Indexed: <b>{counts['indexed']} / {counts['total']}</b>\n\n"
+                "Progress updates will be sent here automatically.",
+                parse_mode="HTML",
+                reply_markup=keyboard([[ ("⬅️ Back", "back") ]]),
+            )
+
         if action == "service":
             if settings["service_enabled"]:
                 await self.db.update_settings(service_enabled=0)
@@ -742,6 +778,101 @@ class ControlBot:
         except Exception as exc:
             log.exception("Control input failed")
             await update.message.reply_text(f"Error: {exc}")
+
+    async def media_input(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+    ):
+        if not self.owner_only(update):
+            return
+        if context.user_data.get("state") != "find_original":
+            return
+        if not self.runtime.running:
+            return await update.effective_message.reply_text(
+                "Start the Media Manager service first."
+            )
+
+        message = update.effective_message
+        media = None
+        kind = None
+        suffix = ".bin"
+
+        if message.photo:
+            media = message.photo[-1]
+            kind = "photo"
+            suffix = ".jpg"
+        elif message.video:
+            media = message.video
+            kind = "video"
+            suffix = ".mp4"
+        elif message.document:
+            mime = str(message.document.mime_type or "")
+            if mime.startswith("image/"):
+                media = message.document
+                kind = "photo"
+                suffix = Path(message.document.file_name or "image.jpg").suffix or ".jpg"
+            elif mime.startswith("video/"):
+                media = message.document
+                kind = "video"
+                suffix = Path(message.document.file_name or "video.mp4").suffix or ".mp4"
+
+        if not media or not kind:
+            return await message.reply_text(
+                "Send an image/screenshot or a video clip."
+            )
+
+        counts = await self.db.reverse_index_counts()
+        if counts["indexed"] == 0:
+            return await message.reply_text(
+                "Search index is empty. Open Find Original Media and tap Build Search Index first."
+            )
+
+        temp = self.runtime.temp_dir / f"reverse_query_{uuid4().hex}{suffix}"
+        status = await message.reply_text("🔎 Searching Database media...")
+        try:
+            telegram_file = await media.get_file()
+            await telegram_file.download_to_drive(custom_path=temp)
+            results = await self.runtime.reverse_search_file(temp, kind)
+
+            if not results or results[0]["score"] < 65:
+                return await status.edit_text(
+                    "❌ No reliable original match found.\n\n"
+                    "Try a clearer screenshot or a slightly longer video clip."
+                )
+
+            lines = ["🔎 <b>Original Media Matches</b>", ""]
+            for index, result in enumerate(results, start=1):
+                link = await self.runtime._message_link(
+                    int(result["database_chat_id"]),
+                    int(result["database_message_id"]),
+                )
+                score = float(result["score"])
+                confidence = (
+                    "Strong" if score >= 85
+                    else "Possible" if score >= 72
+                    else "Weak"
+                )
+                if link:
+                    lines.append(
+                        f'{index}. <a href="{link}">📂 Original Media</a> — '
+                        f'<b>{score:.1f}%</b> ({confidence})'
+                    )
+                else:
+                    lines.append(
+                        f"{index}. Original media — <b>{score:.1f}%</b> ({confidence})"
+                    )
+
+            await status.edit_text(
+                "\n".join(lines),
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+            )
+        except Exception as exc:
+            log.exception("Reverse media search failed")
+            await status.edit_text(f"Search failed: {exc}")
+        finally:
+            temp.unlink(missing_ok=True)
 
     async def finish_login(self, update, context, client):
         session = StringSession.save(client.session)
@@ -974,5 +1105,9 @@ class ControlBot:
         app.add_handler(CommandHandler("start", self.start))
         app.add_handler(CommandHandler("chats", self.chats))
         app.add_handler(CallbackQueryHandler(self.callbacks))
+        app.add_handler(MessageHandler(
+            filters.PHOTO | filters.VIDEO | filters.Document.ALL,
+            self.media_input,
+        ))
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.text))
         return app

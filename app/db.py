@@ -56,6 +56,7 @@ class Database:
         self.database_message_origins = self.database["database_message_origins"]
         self.database_upload_tokens = self.database["database_upload_tokens"]
         self.runtime_locks = self.database["runtime_locks"]
+        self.reverse_media_index = self.database["reverse_media_index"]
 
     async def initialize(self) -> None:
         await self.client.admin.command("ping")
@@ -78,6 +79,73 @@ class Database:
             [("status", ASCENDING), ("id", ASCENDING)],
             name="pending_queue_order",
         )
+        await self.reverse_media_index.create_index(
+            [("database_chat_id", ASCENDING), ("database_message_id", ASCENDING)],
+            unique=True,
+            name="reverse_media_message",
+        )
+        await self.reverse_media_index.create_index(
+            [("media_kind", ASCENDING)],
+            name="reverse_media_kind",
+        )
+
+    async def upsert_reverse_media_fingerprint(
+        self,
+        *,
+        media_id: int,
+        media_kind: str,
+        database_chat_id: int,
+        database_message_id: int,
+        frame_hashes: list[str],
+    ) -> None:
+        await self.reverse_media_index.update_one(
+            {
+                "database_chat_id": int(database_chat_id),
+                "database_message_id": int(database_message_id),
+            },
+            {
+                "$set": {
+                    "media_id": int(media_id),
+                    "media_kind": str(media_kind),
+                    "database_chat_id": int(database_chat_id),
+                    "database_message_id": int(database_message_id),
+                    "frame_hashes": list(frame_hashes),
+                    "updated_at": now(),
+                },
+                "$setOnInsert": {"created_at": now()},
+            },
+            upsert=True,
+        )
+
+    async def reverse_index_counts(self) -> dict:
+        total_media = await self.media.count_documents(
+            {"media_kind": {"$in": ["video", "photo"]}}
+        )
+        indexed = await self.reverse_media_index.count_documents({})
+        return {"total": int(total_media), "indexed": int(indexed)}
+
+    async def unindexed_reverse_media(self, limit: int = 100) -> list[dict]:
+        rows: list[dict] = []
+        cursor = self.media.find(
+            {"media_kind": {"$in": ["video", "photo"]}}
+        ).sort("id", ASCENDING)
+        async for media in cursor:
+            exists = await self.reverse_media_index.find_one(
+                {
+                    "database_chat_id": int(media.get("database_chat_id") or 0),
+                    "database_message_id": int(media.get("database_message_id") or 0),
+                },
+                {"_id": 1},
+            )
+            if exists:
+                continue
+            rows.append(dict(media))
+            if len(rows) >= int(limit):
+                break
+        return rows
+
+    async def all_reverse_fingerprints(self) -> list[dict]:
+        return [dict(row) async for row in self.reverse_media_index.find({})]
 
     async def close(self) -> None:
         await self.client.close()
