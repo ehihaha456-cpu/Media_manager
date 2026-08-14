@@ -110,6 +110,7 @@ class Database:
                     "database_chat_id": int(database_chat_id),
                     "database_message_id": int(database_message_id),
                     "frame_hashes": list(frame_hashes),
+                    "fingerprint_version": 2,
                     "updated_at": now(),
                 },
                 "$setOnInsert": {"created_at": now()},
@@ -121,7 +122,7 @@ class Database:
         total_media = await self.media.count_documents(
             {"media_kind": {"$in": ["video", "photo"]}}
         )
-        indexed = await self.reverse_media_index.count_documents({})
+        indexed = await self.reverse_media_index.count_documents({"fingerprint_version": 2})
         return {"total": int(total_media), "indexed": int(indexed)}
 
     async def unindexed_reverse_media(self, limit: int = 100) -> list[dict]:

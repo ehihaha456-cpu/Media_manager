@@ -71,25 +71,64 @@ class MediaRuntime:
         self.self_uploaded_database_ids: set[int] = set()
         self.reverse_index_task: asyncio.Task | None = None
 
+    # Reverse-search fingerprint format/version.
+    REVERSE_FP_VERSION = 2
+
     @staticmethod
-    def _dhash_image(path: Path) -> str:
-        with Image.open(path) as image:
-            image = image.convert("L").resize((9, 8))
-            pixels = list(image.getdata())
-        value = 0
-        bit = 0
-        for y in range(8):
-            row = y * 9
-            for x in range(8):
-                if pixels[row + x] > pixels[row + x + 1]:
-                    value |= 1 << bit
-                bit += 1
-        return f"{value:016x}"
+    def _image_hashes(path: Path) -> list[str]:
+        """Create crop-tolerant perceptual fingerprints.
+
+        We deliberately fingerprint several crops because a user may send a
+        screenshot of a Telegram video/photo with UI bars around the media.
+        Each region gets dHash + aHash. The compact hashes survive resize and
+        moderate recompression much better than SHA-256.
+        """
+        import numpy as np
+
+        def dhash(image: Image.Image) -> str:
+            image = image.convert("L").resize((9, 8), Image.Resampling.LANCZOS)
+            arr = np.asarray(image, dtype=np.uint8)
+            bits = (arr[:, :-1] > arr[:, 1:]).flatten()
+            value = 0
+            for bit in bits:
+                value = (value << 1) | int(bit)
+            return f"{value:016x}"
+
+        def ahash(image: Image.Image) -> str:
+            image = image.convert("L").resize((8, 8), Image.Resampling.LANCZOS)
+            arr = np.asarray(image, dtype=np.float32)
+            avg = float(arr.mean())
+            bits = (arr >= avg).flatten()
+            value = 0
+            for bit in bits:
+                value = (value << 1) | int(bit)
+            return f"{value:016x}"
+
+        w, h = image.size
+        regions = [
+            ("f", image),
+        ]
+        # Ignore Telegram/browser borders while keeping the original region.
+        for name, frac in (("c90", 0.90), ("c80", 0.80), ("c70", 0.70)):
+            cw, ch = max(32, int(w * frac)), max(32, int(h * frac))
+            left = max(0, (w - cw) // 2)
+            top = max(0, (h - ch) // 2)
+            regions.append((name, image.crop((left, top, left + cw, top + ch))))
+
+        out = []
+        for name, region in regions:
+            out.append(f"d:{name}:{dhash(region)}")
+            out.append(f"a:{name}:{ahash(region)}")
+        return out
 
     @staticmethod
     def _hash_similarity(left: str, right: str) -> float:
         try:
-            distance = (int(left, 16) ^ int(right, 16)).bit_count()
+            lp = left.split(":")
+            rp = right.split(":")
+            if len(lp) != 3 or len(rp) != 3 or lp[:2] != rp[:2]:
+                return 0.0
+            distance = (int(lp[2], 16) ^ int(rp[2], 16)).bit_count()
         except Exception:
             return 0.0
         return max(0.0, 100.0 * (64 - distance) / 64)
@@ -110,9 +149,9 @@ class MediaRuntime:
         except Exception:
             return 0.0
 
-    async def _video_frame_hashes(self, path: Path, count: int = 8) -> list[str]:
+    async def _video_frame_hashes(self, path: Path, count: int = 12) -> list[str]:
         duration = await self._video_duration(path)
-        rate = max(0.03, min(2.0, float(count) / max(duration, 1.0)))
+        rate = max(0.03, min(3.0, float(count) / max(duration, 1.0)))
         frame_dir = self.temp_dir / f"reverse_frames_{uuid4().hex}"
         frame_dir.mkdir(parents=True, exist_ok=True)
         output = frame_dir / "frame_%03d.jpg"
@@ -121,7 +160,7 @@ class MediaRuntime:
                 "ffmpeg",
                 "-hide_banner", "-loglevel", "error", "-y",
                 "-i", str(path),
-                "-vf", f"fps={rate},scale=480:-2",
+                "-vf", f"fps={rate},scale=640:-2",
                 "-frames:v", str(max(1, count)),
                 str(output),
                 stdout=asyncio.subprocess.DEVNULL,
@@ -137,7 +176,13 @@ class MediaRuntime:
             hashes = []
             for frame in sorted(frame_dir.glob("frame_*.jpg")):
                 try:
-                    hashes.append(await asyncio.to_thread(self._dhash_image, frame))
+                    with Image.open(frame) as image:
+                        hashes.extend(
+                            await asyncio.to_thread(
+                                self._image_hashes,
+                                image.copy(),
+                            )
+                        )
                 except Exception:
                     log.exception("Could not hash extracted frame: %s", frame)
             return hashes
@@ -152,12 +197,16 @@ class MediaRuntime:
     async def _fingerprint_local_media(self, path: Path, kind: str) -> list[str]:
         if kind == "photo":
             try:
-                return [await asyncio.to_thread(self._dhash_image, path)]
+                with Image.open(path) as image:
+                    return await asyncio.to_thread(
+                        self._image_hashes,
+                        image.copy(),
+                    )
             except Exception:
                 log.exception("Could not fingerprint image: %s", path)
                 return []
         if kind == "video":
-            return await self._video_frame_hashes(path, count=8)
+            return await self._video_frame_hashes(path, count=12)
         return []
 
     async def _index_local_database_media(
@@ -297,15 +346,19 @@ class MediaRuntime:
                 continue
             per_query = []
             for query_hash in query_hashes:
-                per_query.append(max(
+                best = max(
                     self._hash_similarity(query_hash, stored_hash)
                     for stored_hash in stored
-                ))
+                )
+                if best > 0:
+                    per_query.append(best)
             if not per_query:
                 continue
-            # A screenshot only has one frame. For clips, average the best
-            # visual correspondence for each sampled query frame.
-            score = sum(per_query) / len(per_query)
+            # Each query crop/hash may map to the same source frame. Use the
+            # strongest evidence while avoiding unrelated weak hashes.
+            per_query.sort(reverse=True)
+            keep = max(1, min(6, len(per_query)))
+            score = sum(per_query[:keep]) / keep
             results.append({
                 "score": round(score, 1),
                 "database_chat_id": int(candidate["database_chat_id"]),
