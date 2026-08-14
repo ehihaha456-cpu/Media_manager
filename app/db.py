@@ -125,12 +125,20 @@ class Database:
         indexed = await self.reverse_media_index.count_documents({"fingerprint_version": 2})
         return {"total": int(total_media), "indexed": int(indexed)}
 
-    async def unindexed_reverse_media(self, limit: int = 100) -> list[dict]:
+    async def unindexed_reverse_media(
+        self,
+        limit: int = 100,
+        exclude_media_ids: set[int] | None = None,
+    ) -> list[dict]:
         rows: list[dict] = []
+        excluded = {int(value) for value in (exclude_media_ids or set())}
         cursor = self.media.find(
             {"media_kind": {"$in": ["video", "photo"]}}
         ).sort("id", ASCENDING)
         async for media in cursor:
+            media_id = int(media.get("id") or media.get("_id") or 0)
+            if media_id in excluded:
+                continue
             # Only a current fingerprint-version record counts as indexed.
             # Older/partial index records must be rebuilt.
             exists = await self.reverse_media_index.find_one(
