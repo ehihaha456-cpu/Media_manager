@@ -131,10 +131,13 @@ class Database:
             {"media_kind": {"$in": ["video", "photo"]}}
         ).sort("id", ASCENDING)
         async for media in cursor:
+            # Only a current fingerprint-version record counts as indexed.
+            # Older/partial index records must be rebuilt.
             exists = await self.reverse_media_index.find_one(
                 {
                     "database_chat_id": int(media.get("database_chat_id") or 0),
                     "database_message_id": int(media.get("database_message_id") or 0),
+                    "fingerprint_version": 2,
                 },
                 {"_id": 1},
             )

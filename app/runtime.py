@@ -264,7 +264,10 @@ class MediaRuntime:
                 ),
                 parse_mode="HTML",
             )
-            while self.running:
+            # Run until all unindexed media are handled. The index task is
+            # independent of the polling loop and must not stop just because
+            # the live media monitor temporarily changes its running state.
+            while True:
                 rows = await self.db.unindexed_reverse_media(limit=20)
                 if not rows:
                     break
