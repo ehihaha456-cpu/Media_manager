@@ -527,35 +527,25 @@ class ControlBot:
 
         if action == "find_original":
             context.user_data["state"] = "find_original"
-            counts = await self.db.reverse_index_counts()
+            # Indexing is automatic and silent. The owner only sends the
+            # screenshot/photo/clip; the runtime keeps the Database index
+            # updated in the background.
+            await self.runtime.start_reverse_index_build(silent=True)
             return await q.edit_message_text(
                 "🔎 <b>Find Original Media</b>\n\n"
                 "Send a screenshot/photo or a short cut video.\n"
-                "I will compare it with the Database search index.\n\n"
-                f"Indexed: <b>{counts['indexed']} / {counts['total']}</b>\n\n"
-                "For best results, build the search index after your Database history upload is complete.",
+                "I will automatically compare it with Database media and return the closest original.\n\n"
+                "🧠 Search index is maintained automatically in the background.",
                 parse_mode="HTML",
-                reply_markup=keyboard([
-                    [("🧠 Build / Continue Search Index", "build_search_index")],
-                    [("⬅️ Back", "back")],
-                ]),
+                reply_markup=keyboard([[("⬅️ Back", "back")]]),
             )
 
         if action == "build_search_index":
-            started = await self.runtime.start_reverse_index_build()
-            if not started:
-                return await q.answer(
-                    "Start the Media Manager service first.",
-                    show_alert=True,
-                )
-            await q.answer("Search indexing started ✅", show_alert=False)
-            counts = await self.db.reverse_index_counts()
-            return await q.edit_message_text(
-                "🧠 <b>Search Index Running</b>\n\n"
-                f"Indexed: <b>{counts['indexed']} / {counts['total']}</b>\n\n"
-                "Progress updates will be sent here automatically.",
-                parse_mode="HTML",
-                reply_markup=keyboard([[ ("⬅️ Back", "back") ]]),
+            # Kept for old callback buttons; indexing is now automatic.
+            await self.runtime.start_reverse_index_build(silent=True)
+            return await q.answer(
+                "Search index is automatic now. Just send the media to search.",
+                show_alert=False,
             )
 
         if action == "service":
@@ -822,11 +812,10 @@ class ControlBot:
                 "Send an image/screenshot or a video clip."
             )
 
-        counts = await self.db.reverse_index_counts()
-        if counts["indexed"] == 0:
-            return await message.reply_text(
-                "Search index is empty. Open Find Original Media and tap Build Search Index first."
-            )
+        # Never require a manual index build. Start/continue the silent
+        # background backfill automatically, then search whatever is already
+        # indexed. Newly uploaded Database media is fingerprinted immediately.
+        await self.runtime.start_reverse_index_build(silent=True)
 
         temp = self.runtime.temp_dir / f"reverse_query_{uuid4().hex}{suffix}"
         status = await message.reply_text("🔎 Searching Database media...")

@@ -134,7 +134,7 @@ class Database:
         excluded = {int(value) for value in (exclude_media_ids or set())}
         cursor = self.media.find(
             {"media_kind": {"$in": ["video", "photo"]}}
-        ).sort("id", ASCENDING)
+        ).sort("id", -1)
         async for media in cursor:
             media_id = int(media.get("id") or media.get("_id") or 0)
             if media_id in excluded:

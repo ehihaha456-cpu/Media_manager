@@ -238,37 +238,48 @@ class MediaRuntime:
                 database_message_id,
             )
 
-    async def start_reverse_index_build(self) -> bool:
+    async def start_reverse_index_build(self, *, silent: bool = True) -> bool:
+        """Start reverse-search indexing automatically in the background.
+
+        The owner does not need to manually build an index.  Newly uploaded
+        Database media is indexed immediately, while older Database history
+        is backfilled silently in the background.
+        """
         if not self.running or not self.client:
             return False
         if self.reverse_index_task and not self.reverse_index_task.done():
             return True
         self.reverse_index_task = asyncio.create_task(
-            self._build_reverse_search_index(),
+            self._build_reverse_search_index(silent=silent),
             name="reverse-search-index",
         )
         return True
 
-    async def _build_reverse_search_index(self) -> None:
+    async def _build_reverse_search_index(self, *, silent: bool = True) -> None:
         indexed_now = 0
         failed = 0
+        failed_media_ids: set[int] = set()
         try:
             counts = await self.db.reverse_index_counts()
-            await self.alert_bot.send_message(
-                chat_id=self.owner_id,
-                text=(
-                    "🔎 <b>Search Index Started</b>\n\n"
-                    f"Indexed: <b>{counts['indexed']}</b>\n"
-                    f"Total Media: <b>{counts['total']}</b>\n\n"
-                    "Images and video keyframes are being fingerprinted."
-                ),
-                parse_mode="HTML",
-            )
+            if not silent:
+                await self.alert_bot.send_message(
+                    chat_id=self.owner_id,
+                    text=(
+                        "🔎 <b>Search Index Started</b>\n\n"
+                        f"Indexed: <b>{counts['indexed']}</b>\n"
+                        f"Total Media: <b>{counts['total']}</b>\n\n"
+                        "Images and video keyframes are being fingerprinted."
+                    ),
+                    parse_mode="HTML",
+                )
             # Run until all unindexed media are handled. The index task is
             # independent of the polling loop and must not stop just because
             # the live media monitor temporarily changes its running state.
             while True:
-                rows = await self.db.unindexed_reverse_media(limit=20)
+                rows = await self.db.unindexed_reverse_media(
+                    limit=20,
+                    exclude_media_ids=failed_media_ids,
+                )
                 if not rows:
                     break
                 for record in rows:
@@ -280,15 +291,18 @@ class MediaRuntime:
                         message = await self.client.get_messages(chat_id, ids=message_id)
                         if not message or not getattr(message, "media", None):
                             failed += 1
+                            failed_media_ids.add(int(record["id"]))
                             continue
                         downloaded = await message.download_media(file=str(temp))
                         if not downloaded:
                             failed += 1
+                            failed_media_ids.add(int(record["id"]))
                             continue
                         local = Path(downloaded)
                         hashes = await self._fingerprint_local_media(local, kind)
                         if not hashes:
                             failed += 1
+                            failed_media_ids.add(int(record["id"]))
                             continue
                         await self.db.upsert_reverse_media_fingerprint(
                             media_id=int(record["id"]),
@@ -298,7 +312,7 @@ class MediaRuntime:
                             frame_hashes=hashes,
                         )
                         indexed_now += 1
-                        if indexed_now % 50 == 0:
+                        if indexed_now % 50 == 0 and not silent:
                             current = await self.db.reverse_index_counts()
                             await self.alert_bot.send_message(
                                 chat_id=self.owner_id,
@@ -313,6 +327,7 @@ class MediaRuntime:
                         raise
                     except Exception:
                         failed += 1
+                        failed_media_ids.add(int(record.get("id") or 0))
                         log.exception(
                             "Could not index Database media: %s/%s",
                             chat_id,
@@ -321,15 +336,16 @@ class MediaRuntime:
                     finally:
                         Path(temp).unlink(missing_ok=True)
             final = await self.db.reverse_index_counts()
-            await self.alert_bot.send_message(
-                chat_id=self.owner_id,
-                text=(
-                    "✅ <b>Search Index Complete</b>\n\n"
-                    f"Indexed: <b>{final['indexed']} / {final['total']}</b>\n"
-                    f"Failed/Unavailable: <b>{failed}</b>"
-                ),
-                parse_mode="HTML",
-            )
+            if not silent:
+                await self.alert_bot.send_message(
+                    chat_id=self.owner_id,
+                    text=(
+                        "✅ <b>Search Index Complete</b>\n\n"
+                        f"Indexed: <b>{final['indexed']} / {final['total']}</b>\n"
+                        f"Failed/Unavailable: <b>{failed}</b>"
+                    ),
+                    parse_mode="HTML",
+                )
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -430,6 +446,12 @@ class MediaRuntime:
 
         self.running = True
         self.poll_task = asyncio.create_task(self._poll_loop())
+
+        # Reverse search is automatic: backfill old Database media silently.
+        asyncio.create_task(
+            self.start_reverse_index_build(silent=True),
+            name="auto-reverse-index-start",
+        )
 
         log.info(
             "Media polling runtime started | sources=%s database=%s",
