@@ -527,25 +527,14 @@ class ControlBot:
 
         if action == "find_original":
             context.user_data["state"] = "find_original"
-            # Indexing is automatic and silent. The owner only sends the
-            # screenshot/photo/clip; the runtime keeps the Database index
-            # updated in the background.
-            await self.runtime.start_reverse_index_build(silent=True)
+            await self.runtime.start_reverse_index_build()
             return await q.edit_message_text(
                 "🔎 <b>Find Original Media</b>\n\n"
                 "Send a screenshot/photo or a short cut video.\n"
-                "I will automatically compare it with Database media and return the closest original.\n\n"
-                "🧠 Search index is maintained automatically in the background.",
+                "I will automatically search the Database media.\n\n"
+                "🧠 Database indexing runs automatically in the background.",
                 parse_mode="HTML",
                 reply_markup=keyboard([[("⬅️ Back", "back")]]),
-            )
-
-        if action == "build_search_index":
-            # Kept for old callback buttons; indexing is now automatic.
-            await self.runtime.start_reverse_index_build(silent=True)
-            return await q.answer(
-                "Search index is automatic now. Just send the media to search.",
-                show_alert=False,
             )
 
         if action == "service":
@@ -812,10 +801,8 @@ class ControlBot:
                 "Send an image/screenshot or a video clip."
             )
 
-        # Never require a manual index build. Start/continue the silent
-        # background backfill automatically, then search whatever is already
-        # indexed. Newly uploaded Database media is fingerprinted immediately.
-        await self.runtime.start_reverse_index_build(silent=True)
+        # Search indexing is automatic; never ask the owner to build it manually.
+        await self.runtime.start_reverse_index_build()
 
         temp = self.runtime.temp_dir / f"reverse_query_{uuid4().hex}{suffix}"
         status = await message.reply_text("🔎 Searching Database media...")
@@ -824,7 +811,7 @@ class ControlBot:
             await telegram_file.download_to_drive(custom_path=temp)
             results = await self.runtime.reverse_search_file(temp, kind)
 
-            if not results or results[0]["score"] < 65:
+            if not results or results[0]["score"] < 58:
                 return await status.edit_text(
                     "❌ No reliable original match found.\n\n"
                     "Try a clearer screenshot or a slightly longer video clip."

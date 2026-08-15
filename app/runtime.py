@@ -72,17 +72,11 @@ class MediaRuntime:
         self.reverse_index_task: asyncio.Task | None = None
 
     # Reverse-search fingerprint format/version.
-    REVERSE_FP_VERSION = 2
+    REVERSE_FP_VERSION = 3
 
     @staticmethod
-    def _image_hashes(path: Path) -> list[str]:
-        """Create crop-tolerant perceptual fingerprints.
-
-        We deliberately fingerprint several crops because a user may send a
-        screenshot of a Telegram video/photo with UI bars around the media.
-        Each region gets dHash + aHash. The compact hashes survive resize and
-        moderate recompression much better than SHA-256.
-        """
+    def _image_hashes(path_or_image) -> list[str]:
+        """Create robust perceptual fingerprints for exact and cropped matches."""
         import numpy as np
 
         def dhash(image: Image.Image) -> str:
@@ -97,23 +91,32 @@ class MediaRuntime:
         def ahash(image: Image.Image) -> str:
             image = image.convert("L").resize((8, 8), Image.Resampling.LANCZOS)
             arr = np.asarray(image, dtype=np.float32)
-            avg = float(arr.mean())
-            bits = (arr >= avg).flatten()
+            bits = (arr >= float(arr.mean())).flatten()
             value = 0
             for bit in bits:
                 value = (value << 1) | int(bit)
             return f"{value:016x}"
 
+        image = path_or_image
         w, h = image.size
-        regions = [
-            ("f", image),
-        ]
-        # Ignore Telegram/browser borders while keeping the original region.
-        for name, frac in (("c90", 0.90), ("c80", 0.80), ("c70", 0.70)):
+        regions = [("full", image)]
+
+        # Center crops plus a 2x2 grid make screenshots/cut frames searchable
+        # even when Telegram UI or black bars cover part of the source.
+        for name, frac in (("c95", .95), ("c85", .85), ("c70", .70)):
             cw, ch = max(32, int(w * frac)), max(32, int(h * frac))
-            left = max(0, (w - cw) // 2)
-            top = max(0, (h - ch) // 2)
-            regions.append((name, image.crop((left, top, left + cw, top + ch))))
+            left, top = max(0, (w-cw)//2), max(0, (h-ch)//2)
+            regions.append((name, image.crop((left, top, left+cw, top+ch))))
+
+        # Keep tiles large enough to preserve meaningful visual structure.
+        if w >= 96 and h >= 96:
+            mx, my = w // 2, h // 2
+            regions.extend([
+                ("tl", image.crop((0, 0, mx, my))),
+                ("tr", image.crop((mx, 0, w, my))),
+                ("bl", image.crop((0, my, mx, h))),
+                ("br", image.crop((mx, my, w, h))),
+            ])
 
         out = []
         for name, region in regions:
@@ -238,48 +241,27 @@ class MediaRuntime:
                 database_message_id,
             )
 
-    async def start_reverse_index_build(self, *, silent: bool = True) -> bool:
-        """Start reverse-search indexing automatically in the background.
-
-        The owner does not need to manually build an index.  Newly uploaded
-        Database media is indexed immediately, while older Database history
-        is backfilled silently in the background.
-        """
+    async def start_reverse_index_build(self) -> bool:
         if not self.running or not self.client:
             return False
         if self.reverse_index_task and not self.reverse_index_task.done():
             return True
         self.reverse_index_task = asyncio.create_task(
-            self._build_reverse_search_index(silent=silent),
+            self._build_reverse_search_index(),
             name="reverse-search-index",
         )
         return True
 
-    async def _build_reverse_search_index(self, *, silent: bool = True) -> None:
+    async def _build_reverse_search_index(self) -> None:
         indexed_now = 0
         failed = 0
-        failed_media_ids: set[int] = set()
         try:
             counts = await self.db.reverse_index_counts()
-            if not silent:
-                await self.alert_bot.send_message(
-                    chat_id=self.owner_id,
-                    text=(
-                        "🔎 <b>Search Index Started</b>\n\n"
-                        f"Indexed: <b>{counts['indexed']}</b>\n"
-                        f"Total Media: <b>{counts['total']}</b>\n\n"
-                        "Images and video keyframes are being fingerprinted."
-                    ),
-                    parse_mode="HTML",
-                )
             # Run until all unindexed media are handled. The index task is
             # independent of the polling loop and must not stop just because
             # the live media monitor temporarily changes its running state.
             while True:
-                rows = await self.db.unindexed_reverse_media(
-                    limit=20,
-                    exclude_media_ids=failed_media_ids,
-                )
+                rows = await self.db.unindexed_reverse_media(limit=20)
                 if not rows:
                     break
                 for record in rows:
@@ -291,18 +273,15 @@ class MediaRuntime:
                         message = await self.client.get_messages(chat_id, ids=message_id)
                         if not message or not getattr(message, "media", None):
                             failed += 1
-                            failed_media_ids.add(int(record["id"]))
                             continue
                         downloaded = await message.download_media(file=str(temp))
                         if not downloaded:
                             failed += 1
-                            failed_media_ids.add(int(record["id"]))
                             continue
                         local = Path(downloaded)
                         hashes = await self._fingerprint_local_media(local, kind)
                         if not hashes:
                             failed += 1
-                            failed_media_ids.add(int(record["id"]))
                             continue
                         await self.db.upsert_reverse_media_fingerprint(
                             media_id=int(record["id"]),
@@ -312,22 +291,13 @@ class MediaRuntime:
                             frame_hashes=hashes,
                         )
                         indexed_now += 1
-                        if indexed_now % 50 == 0 and not silent:
+                        if indexed_now % 50 == 0:
                             current = await self.db.reverse_index_counts()
-                            await self.alert_bot.send_message(
-                                chat_id=self.owner_id,
-                                text=(
-                                    "⏳ <b>Search Index Progress</b>\n\n"
-                                    f"Indexed: <b>{current['indexed']} / {current['total']}</b>\n"
-                                    f"Failed/Unavailable: <b>{failed}</b>"
-                                ),
-                                parse_mode="HTML",
-                            )
+                            log.info("Reverse-search index progress: %s/%s indexed, %s failed", current["indexed"], current["total"], failed)
                     except asyncio.CancelledError:
                         raise
                     except Exception:
                         failed += 1
-                        failed_media_ids.add(int(record.get("id") or 0))
                         log.exception(
                             "Could not index Database media: %s/%s",
                             chat_id,
@@ -336,16 +306,7 @@ class MediaRuntime:
                     finally:
                         Path(temp).unlink(missing_ok=True)
             final = await self.db.reverse_index_counts()
-            if not silent:
-                await self.alert_bot.send_message(
-                    chat_id=self.owner_id,
-                    text=(
-                        "✅ <b>Search Index Complete</b>\n\n"
-                        f"Indexed: <b>{final['indexed']} / {final['total']}</b>\n"
-                        f"Failed/Unavailable: <b>{failed}</b>"
-                    ),
-                    parse_mode="HTML",
-                )
+            log.info("Reverse-search index complete: %s/%s indexed, %s failed", final["indexed"], final["total"], failed)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -363,21 +324,19 @@ class MediaRuntime:
             stored = [str(x) for x in candidate.get("frame_hashes", []) if x]
             if not stored:
                 continue
-            per_query = []
+            scores = []
             for query_hash in query_hashes:
-                best = max(
-                    self._hash_similarity(query_hash, stored_hash)
-                    for stored_hash in stored
-                )
-                if best > 0:
-                    per_query.append(best)
-            if not per_query:
+                best = max(self._hash_similarity(query_hash, stored_hash) for stored_hash in stored)
+                if best >= 35:
+                    scores.append(best)
+            if not scores:
                 continue
-            # Each query crop/hash may map to the same source frame. Use the
-            # strongest evidence while avoiding unrelated weak hashes.
-            per_query.sort(reverse=True)
-            keep = max(1, min(6, len(per_query)))
-            score = sum(per_query[:keep]) / keep
+            scores.sort(reverse=True)
+            # Strongest corroborating regions are more useful than averaging
+            # every screenshot/UI crop.
+            keep = min(5, len(scores))
+            top = scores[:keep]
+            score = (top[0] * 0.50) + ((sum(top[1:]) / max(1, len(top)-1)) * 0.50) if len(top) > 1 else top[0]
             results.append({
                 "score": round(score, 1),
                 "database_chat_id": int(candidate["database_chat_id"]),
@@ -385,7 +344,7 @@ class MediaRuntime:
                 "media_kind": candidate.get("media_kind"),
             })
         results.sort(key=lambda row: row["score"], reverse=True)
-        return results[:3]
+        return results[:5]
 
     async def start(self) -> None:
         settings = await self.db.get_settings()
@@ -446,12 +405,8 @@ class MediaRuntime:
 
         self.running = True
         self.poll_task = asyncio.create_task(self._poll_loop())
-
-        # Reverse search is automatic: backfill old Database media silently.
-        asyncio.create_task(
-            self.start_reverse_index_build(silent=True),
-            name="auto-reverse-index-start",
-        )
+        # Visual search indexing is automatic and silent.
+        await self.start_reverse_index_build()
 
         log.info(
             "Media polling runtime started | sources=%s database=%s",
