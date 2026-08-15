@@ -74,137 +74,128 @@ class MediaRuntime:
     # Reverse-search fingerprint format/version.
     REVERSE_FP_VERSION = 3
 
+
     @staticmethod
     def _image_hashes(path_or_image) -> list[str]:
-        """Create robust perceptual fingerprints for exact and cropped matches."""
+        """Create grouped multi-signal perceptual fingerprints."""
         import numpy as np
+        image = path_or_image
 
-        def dhash(image: Image.Image) -> str:
-            image = image.convert("L").resize((9, 8), Image.Resampling.LANCZOS)
-            arr = np.asarray(image, dtype=np.uint8)
+        def dhash(img):
+            img = img.convert("L").resize((17, 16), Image.Resampling.LANCZOS)
+            arr = np.asarray(img, dtype=np.uint8)
             bits = (arr[:, :-1] > arr[:, 1:]).flatten()
             value = 0
-            for bit in bits:
-                value = (value << 1) | int(bit)
-            return f"{value:016x}"
+            for bit in bits: value = (value << 1) | int(bit)
+            return f"{value:032x}"
 
-        def ahash(image: Image.Image) -> str:
-            image = image.convert("L").resize((8, 8), Image.Resampling.LANCZOS)
-            arr = np.asarray(image, dtype=np.float32)
+        def ahash(img):
+            img = img.convert("L").resize((16, 16), Image.Resampling.LANCZOS)
+            arr = np.asarray(img, dtype=np.float32)
             bits = (arr >= float(arr.mean())).flatten()
             value = 0
-            for bit in bits:
-                value = (value << 1) | int(bit)
+            for bit in bits: value = (value << 1) | int(bit)
+            return f"{value:032x}"
+
+        def phash(img):
+            arr = np.asarray(
+                img.convert("L").resize((32, 32), Image.Resampling.LANCZOS),
+                dtype=np.float32,
+            )
+            x = np.arange(32, dtype=np.float32)
+            c = np.cos(np.pi * (2*x[:, None] + 1) * x[None, :] / 64.0)
+            c[0, :] *= 1.0 / np.sqrt(2.0)
+            dct = (c @ arr @ c.T) / 16.0
+            low = dct[:8, :8]
+            med = float(np.median(low[1:, 1:]))
+            bits = (low >= med).flatten()
+            value = 0
+            for bit in bits: value = (value << 1) | int(bit)
             return f"{value:016x}"
 
-        image = path_or_image
         w, h = image.size
-        regions = [("full", image)]
-
-        # Center crops plus a 2x2 grid make screenshots/cut frames searchable
-        # even when Telegram UI or black bars cover part of the source.
-        for name, frac in (("c95", .95), ("c85", .85), ("c70", .70)):
-            cw, ch = max(32, int(w * frac)), max(32, int(h * frac))
-            left, top = max(0, (w-cw)//2), max(0, (h-ch)//2)
-            regions.append((name, image.crop((left, top, left+cw, top+ch))))
-
-        # Keep tiles large enough to preserve meaningful visual structure.
-        if w >= 96 and h >= 96:
-            mx, my = w // 2, h // 2
-            regions.extend([
-                ("tl", image.crop((0, 0, mx, my))),
-                ("tr", image.crop((mx, 0, w, my))),
-                ("bl", image.crop((0, my, mx, h))),
-                ("br", image.crop((mx, my, w, h))),
-            ])
-
-        out = []
-        for name, region in regions:
-            out.append(f"d:{name}:{dhash(region)}")
-            out.append(f"a:{name}:{ahash(region)}")
+        boxes = [
+            ("full", (0, 0, w, h)),
+            ("c90", (int(w*.05), int(h*.05), max(int(w*.95), 32), max(int(h*.95), 32))),
+            ("center", (int(w*.15), int(h*.15), max(int(w*.85), 32), max(int(h*.85), 32))),
+        ]
+        out=[]
+        for name, box in boxes:
+            region=image.crop(box)
+            out += [f"d:{name}:{dhash(region)}", f"a:{name}:{ahash(region)}", f"p:{name}:{phash(region)}"]
         return out
 
     @staticmethod
     def _hash_similarity(left: str, right: str) -> float:
         try:
-            lp = left.split(":")
-            rp = right.split(":")
+            lp, rp = left.split(":"), right.split(":")
             if len(lp) != 3 or len(rp) != 3 or lp[:2] != rp[:2]:
                 return 0.0
-            distance = (int(lp[2], 16) ^ int(rp[2], 16)).bit_count()
+            distance=(int(lp[2],16)^int(rp[2],16)).bit_count()
+            bits=64 if lp[0] in ("d","a") and len(lp[2]) <= 16 else 256 if lp[0] in ("d","a") else 64
+            return max(0.0, 100.0*(bits-distance)/bits)
         except Exception:
             return 0.0
-        return max(0.0, 100.0 * (64 - distance) / 64)
+
+    @staticmethod
+    def _group_hashes(hashes: list[str]) -> list[list[str]]:
+        groups={}
+        legacy=[]
+        for value in hashes:
+            value=str(value)
+            if "|" in value and value.startswith("g"):
+                group, fp=value.split("|",1)
+                groups.setdefault(group,[]).append(fp)
+            else:
+                legacy.append(value)
+        return list(groups.values()) if groups else ([legacy] if legacy else [])
 
     async def _video_duration(self, path: Path) -> float:
         try:
-            proc = await asyncio.create_subprocess_exec(
-                "ffprobe",
-                "-v", "error",
-                "-show_entries", "format=duration",
-                "-of", "default=noprint_wrappers=1:nokey=1",
-                str(path),
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.DEVNULL,
-            )
-            stdout, _ = await proc.communicate()
-            return max(0.0, float((stdout or b"0").decode().strip() or 0))
+            proc=await asyncio.create_subprocess_exec(
+                "ffprobe","-v","error","-show_entries","format=duration",
+                "-of","default=noprint_wrappers=1:nokey=1",str(path),
+                stdout=asyncio.subprocess.PIPE,stderr=asyncio.subprocess.DEVNULL)
+            stdout,_=await proc.communicate()
+            return max(0.0,float((stdout or b"0").decode().strip() or 0))
         except Exception:
             return 0.0
 
-    async def _video_frame_hashes(self, path: Path, count: int = 12) -> list[str]:
-        duration = await self._video_duration(path)
-        rate = max(0.03, min(3.0, float(count) / max(duration, 1.0)))
-        frame_dir = self.temp_dir / f"reverse_frames_{uuid4().hex}"
-        frame_dir.mkdir(parents=True, exist_ok=True)
-        output = frame_dir / "frame_%03d.jpg"
+    async def _video_frame_hashes(self, path: Path, count: int = 16) -> list[str]:
+        duration=await self._video_duration(path)
+        frame_dir=self.temp_dir/f"reverse_frames_{uuid4().hex}"
+        frame_dir.mkdir(parents=True,exist_ok=True)
+        output=frame_dir/"frame_%03d.jpg"
         try:
-            proc = await asyncio.create_subprocess_exec(
-                "ffmpeg",
-                "-hide_banner", "-loglevel", "error", "-y",
-                "-i", str(path),
-                "-vf", f"fps={rate},scale=640:-2",
-                "-frames:v", str(max(1, count)),
-                str(output),
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            _, stderr = await proc.communicate()
+            fps=max(0.01,float(count)/max(duration,1.0))
+            proc=await asyncio.create_subprocess_exec(
+                "ffmpeg","-hide_banner","-loglevel","error","-y","-i",str(path),
+                "-vf",f"fps={fps},scale=640:-2","-frames:v",str(count),str(output),
+                stdout=asyncio.subprocess.DEVNULL,stderr=asyncio.subprocess.PIPE)
+            _,stderr=await proc.communicate()
             if proc.returncode != 0:
-                log.warning(
-                    "Reverse-search frame extraction failed: %s",
-                    (stderr or b"").decode("utf-8", errors="replace")[-500:],
-                )
+                log.warning("Reverse-search frame extraction failed: %s",(stderr or b"").decode(errors="replace")[-500:])
                 return []
-            hashes = []
-            for frame in sorted(frame_dir.glob("frame_*.jpg")):
+            hashes=[]
+            for n,frame in enumerate(sorted(frame_dir.glob("frame_*.jpg"))):
                 try:
                     with Image.open(frame) as image:
-                        hashes.extend(
-                            await asyncio.to_thread(
-                                self._image_hashes,
-                                image.copy(),
-                            )
-                        )
+                        vals=await asyncio.to_thread(self._image_hashes,image.copy())
+                    hashes.extend([f"g{n}|{v}" for v in vals])
                 except Exception:
-                    log.exception("Could not hash extracted frame: %s", frame)
+                    log.exception("Could not hash extracted frame: %s",frame)
             return hashes
         finally:
-            for frame in frame_dir.glob("*"):
-                frame.unlink(missing_ok=True)
-            try:
-                frame_dir.rmdir()
-            except OSError:
-                pass
+            for frame in frame_dir.glob("*"): frame.unlink(missing_ok=True)
+            try: frame_dir.rmdir()
+            except OSError: pass
 
     async def _fingerprint_local_media(self, path: Path, kind: str) -> list[str]:
         if kind == "photo":
             try:
                 with Image.open(path) as image:
-                    return await asyncio.to_thread(
-                        self._image_hashes,
-                        image.copy(),
-                    )
+                    hashes = await asyncio.to_thread(self._image_hashes, image.copy())
+                    return [f"g0|{value}" for value in hashes]
             except Exception:
                 log.exception("Could not fingerprint image: %s", path)
                 return []
@@ -241,110 +232,105 @@ class MediaRuntime:
                 database_message_id,
             )
 
+
     async def start_reverse_index_build(self) -> bool:
         if not self.running or not self.client:
             return False
         if self.reverse_index_task and not self.reverse_index_task.done():
             return True
-        self.reverse_index_task = asyncio.create_task(
-            self._build_reverse_search_index(),
-            name="reverse-search-index",
-        )
+        self.reverse_index_task=asyncio.create_task(
+            self._build_reverse_search_index(),name="reverse-search-index")
         return True
 
     async def _build_reverse_search_index(self) -> None:
-        indexed_now = 0
-        failed = 0
+        failed_ids=set()
         try:
-            counts = await self.db.reverse_index_counts()
-            # Run until all unindexed media are handled. The index task is
-            # independent of the polling loop and must not stop just because
-            # the live media monitor temporarily changes its running state.
-            while True:
-                rows = await self.db.unindexed_reverse_media(limit=20)
-                if not rows:
-                    break
+            while self.running:
+                rows=await self.db.unindexed_reverse_media(limit=8,exclude_media_ids=failed_ids)
+                if not rows: break
+                progress=False
                 for record in rows:
-                    chat_id = int(record.get("database_chat_id") or 0)
-                    message_id = int(record.get("database_message_id") or 0)
-                    kind = str(record.get("media_kind") or "")
-                    temp = self.temp_dir / f"reverse_index_{uuid4().hex}"
+                    media_id=int(record.get("id") or 0)
+                    chat_id=int(record.get("database_chat_id") or 0)
+                    message_id=int(record.get("database_message_id") or 0)
+                    kind=str(record.get("media_kind") or "")
+                    temp=self.temp_dir/f"reverse_index_{uuid4().hex}"
                     try:
-                        message = await self.client.get_messages(chat_id, ids=message_id)
-                        if not message or not getattr(message, "media", None):
-                            failed += 1
-                            continue
-                        downloaded = await message.download_media(file=str(temp))
+                        message=await asyncio.wait_for(self.client.get_messages(chat_id,ids=message_id),timeout=45)
+                        if not message or not getattr(message,"media",None):
+                            failed_ids.add(media_id); continue
+                        downloaded=await asyncio.wait_for(message.download_media(file=str(temp)),timeout=120)
                         if not downloaded:
-                            failed += 1
-                            continue
-                        local = Path(downloaded)
-                        hashes = await self._fingerprint_local_media(local, kind)
+                            failed_ids.add(media_id); continue
+                        hashes=await asyncio.wait_for(
+                            self._fingerprint_local_media(Path(downloaded),kind),timeout=90)
                         if not hashes:
-                            failed += 1
-                            continue
+                            failed_ids.add(media_id); continue
                         await self.db.upsert_reverse_media_fingerprint(
-                            media_id=int(record["id"]),
-                            media_kind=kind,
-                            database_chat_id=chat_id,
-                            database_message_id=message_id,
-                            frame_hashes=hashes,
-                        )
-                        indexed_now += 1
-                        if indexed_now % 50 == 0:
-                            current = await self.db.reverse_index_counts()
-                            log.info("Reverse-search index progress: %s/%s indexed, %s failed", current["indexed"], current["total"], failed)
+                            media_id=media_id,media_kind=kind,
+                            database_chat_id=chat_id,database_message_id=message_id,
+                            frame_hashes=hashes)
+                        progress=True
                     except asyncio.CancelledError:
                         raise
                     except Exception:
-                        failed += 1
-                        log.exception(
-                            "Could not index Database media: %s/%s",
-                            chat_id,
-                            message_id,
-                        )
+                        failed_ids.add(media_id)
+                        log.exception("Could not index Database media: %s/%s",chat_id,message_id)
                     finally:
                         Path(temp).unlink(missing_ok=True)
-            final = await self.db.reverse_index_counts()
-            log.info("Reverse-search index complete: %s/%s indexed, %s failed", final["indexed"], final["total"], failed)
+                if not progress:
+                    await asyncio.sleep(5)
         except asyncio.CancelledError:
             raise
         except Exception:
-            log.exception("Reverse-search index build failed")
+            log.exception("Automatic reverse-search index build failed")
         finally:
-            self.reverse_index_task = None
+            self.reverse_index_task=None
+
 
     async def reverse_search_file(self, path: Path, kind: str) -> list[dict]:
-        query_hashes = await self._fingerprint_local_media(path, kind)
-        if not query_hashes:
-            return []
-        candidates = await self.db.all_reverse_fingerprints()
-        results: list[dict] = []
+        query_hashes=await self._fingerprint_local_media(path,kind)
+        if not query_hashes: return []
+        qgroups=self._group_hashes(query_hashes)
+        candidates=await self.db.all_reverse_fingerprints()
+        results=[]
         for candidate in candidates:
-            stored = [str(x) for x in candidate.get("frame_hashes", []) if x]
-            if not stored:
-                continue
-            scores = []
-            for query_hash in query_hashes:
-                best = max(self._hash_similarity(query_hash, stored_hash) for stored_hash in stored)
-                if best >= 35:
-                    scores.append(best)
-            if not scores:
-                continue
-            scores.sort(reverse=True)
-            # Strongest corroborating regions are more useful than averaging
-            # every screenshot/UI crop.
-            keep = min(5, len(scores))
-            top = scores[:keep]
-            score = (top[0] * 0.50) + ((sum(top[1:]) / max(1, len(top)-1)) * 0.50) if len(top) > 1 else top[0]
+            sgroups=self._group_hashes([str(x) for x in candidate.get("frame_hashes",[]) if x])
+            if not sgroups: continue
+            region_scores=[]
+            for qg in qgroups:
+                best=0.0
+                for sg in sgroups:
+                    scores={}
+                    for q in qg:
+                        typ=q.split(":")[0]
+                        vals=[self._hash_similarity(q,s) for s in sg if s.split(":")[0]==typ]
+                        if vals: scores[typ]=max(vals)
+                    if scores:
+                        frame=(0.50*scores.get("p",0)+0.30*scores.get("d",0)+0.20*scores.get("a",0))
+                        best=max(best,frame)
+                region_scores.append(best)
+            region_scores.sort(reverse=True)
+            if not region_scores: continue
+            best=region_scores[0]
+            second=region_scores[1] if len(region_scores)>1 else best
+            score=0.75*best+0.25*second
             results.append({
-                "score": round(score, 1),
-                "database_chat_id": int(candidate["database_chat_id"]),
-                "database_message_id": int(candidate["database_message_id"]),
-                "media_kind": candidate.get("media_kind"),
+                "score":round(score,1),"best_frame_score":round(best,1),
+                "supporting_regions":sum(x>=88 for x in region_scores),
+                "database_chat_id":int(candidate["database_chat_id"]),
+                "database_message_id":int(candidate["database_message_id"]),
+                "media_kind":candidate.get("media_kind"),
             })
-        results.sort(key=lambda row: row["score"], reverse=True)
-        return results[:5]
+        results.sort(key=lambda x:(x["score"],x["best_frame_score"]),reverse=True)
+        if not results: return []
+        top=results[0]
+        runner=results[1] if len(results)>1 else None
+        margin=top["score"]-(runner["score"] if runner else 0)
+        # Conservative verification: don't return guesses.
+        reliable=(top["best_frame_score"]>=93 and top["score"]>=89 and
+                  (runner is None or margin>=4 or top["best_frame_score"]>=97))
+        return [top] if reliable else []
 
     async def start(self) -> None:
         settings = await self.db.get_settings()
@@ -405,7 +391,7 @@ class MediaRuntime:
 
         self.running = True
         self.poll_task = asyncio.create_task(self._poll_loop())
-        # Visual search indexing is automatic and silent.
+        # Automatically build/rebuild the visual search index in the background.
         await self.start_reverse_index_build()
 
         log.info(

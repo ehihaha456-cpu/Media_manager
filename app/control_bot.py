@@ -527,12 +527,10 @@ class ControlBot:
 
         if action == "find_original":
             context.user_data["state"] = "find_original"
-            await self.runtime.start_reverse_index_build()
             return await q.edit_message_text(
                 "🔎 <b>Find Original Media</b>\n\n"
-                "Send a screenshot/photo or a short cut video.\n"
-                "I will automatically search the Database media.\n\n"
-                "🧠 Database indexing runs automatically in the background.",
+                "Send a screenshot/photo or a short video clip.\n"
+                "I will automatically search the Database and return only a verified original match.",
                 parse_mode="HTML",
                 reply_markup=keyboard([[("⬅️ Back", "back")]]),
             )
@@ -801,8 +799,9 @@ class ControlBot:
                 "Send an image/screenshot or a video clip."
             )
 
-        # Search indexing is automatic; never ask the owner to build it manually.
-        await self.runtime.start_reverse_index_build()
+        counts = await self.db.reverse_index_counts()
+        if counts["indexed"] == 0:
+            await self.runtime.start_reverse_index_build()
 
         temp = self.runtime.temp_dir / f"reverse_query_{uuid4().hex}{suffix}"
         status = await message.reply_text("🔎 Searching Database media...")
@@ -811,39 +810,23 @@ class ControlBot:
             await telegram_file.download_to_drive(custom_path=temp)
             results = await self.runtime.reverse_search_file(temp, kind)
 
-            if not results or results[0]["score"] < 58:
+            if not results:
                 return await status.edit_text(
                     "❌ No reliable original match found.\n\n"
-                    "Try a clearer screenshot or a slightly longer video clip."
+                    "Send a clearer screenshot or a slightly longer clip."
                 )
 
-            lines = ["🔎 <b>Original Media Matches</b>", ""]
-            for index, result in enumerate(results, start=1):
-                link = await self.runtime._message_link(
-                    int(result["database_chat_id"]),
-                    int(result["database_message_id"]),
-                )
-                score = float(result["score"])
-                confidence = (
-                    "Strong" if score >= 85
-                    else "Possible" if score >= 72
-                    else "Weak"
-                )
-                if link:
-                    lines.append(
-                        f'{index}. <a href="{link}">📂 Original Media</a> — '
-                        f'<b>{score:.1f}%</b> ({confidence})'
-                    )
-                else:
-                    lines.append(
-                        f"{index}. Original media — <b>{score:.1f}%</b> ({confidence})"
-                    )
-
-            await status.edit_text(
-                "\n".join(lines),
-                parse_mode="HTML",
-                disable_web_page_preview=True,
-            )
+            result=results[0]
+            link=await self.runtime._message_link(
+                int(result["database_chat_id"]),int(result["database_message_id"]))
+            score=float(result["score"])
+            text=("✅ <b>Verified Original Media Found</b>\n\n"
+                  f'📂 <a href="{link}">Open Original Media</a>\n'
+                  f"Match confidence: <b>{score:.1f}%</b>") if link else (
+                  "✅ <b>Verified Original Media Found</b>\n\n"
+                  "📂 Original Media\n"
+                  f"Match confidence: <b>{score:.1f}%</b>")
+            await status.edit_text(text,parse_mode="HTML",disable_web_page_preview=True)
         except Exception as exc:
             log.exception("Reverse media search failed")
             await status.edit_text(f"Search failed: {exc}")
