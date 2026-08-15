@@ -110,7 +110,7 @@ class Database:
                     "database_chat_id": int(database_chat_id),
                     "database_message_id": int(database_message_id),
                     "frame_hashes": list(frame_hashes),
-                    "fingerprint_version": 3,
+                    "fingerprint_version": 4,
                     "updated_at": now(),
                 },
                 "$setOnInsert": {"created_at": now()},
@@ -122,19 +122,20 @@ class Database:
         total_media = await self.media.count_documents(
             {"media_kind": {"$in": ["video", "photo"]}}
         )
-        indexed = await self.reverse_media_index.count_documents({"fingerprint_version": 3})
+        indexed = await self.reverse_media_index.count_documents({"fingerprint_version": 4})
         return {"total": int(total_media), "indexed": int(indexed)}
 
     async def unindexed_reverse_media(
         self,
         limit: int = 100,
         exclude_media_ids: set[int] | None = None,
+        newest_first: bool = False,
     ) -> list[dict]:
         rows: list[dict] = []
         excluded = {int(value) for value in (exclude_media_ids or set())}
         cursor = self.media.find(
             {"media_kind": {"$in": ["video", "photo"]}}
-        ).sort("id", ASCENDING)
+        ).sort("id", -1 if newest_first else ASCENDING)
         async for media in cursor:
             media_id = int(media.get("id") or media.get("_id") or 0)
             if media_id in excluded:
@@ -145,7 +146,7 @@ class Database:
                 {
                     "database_chat_id": int(media.get("database_chat_id") or 0),
                     "database_message_id": int(media.get("database_message_id") or 0),
-                    "fingerprint_version": 3,
+                    "fingerprint_version": 4,
                 },
                 {"_id": 1},
             )
