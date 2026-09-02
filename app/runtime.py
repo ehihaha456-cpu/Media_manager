@@ -41,6 +41,9 @@ DATABASE_UPLOAD_TOKEN_ONE = "\u200c"
 DATABASE_UPLOAD_TOKEN_BITS = 128
 UPLOAD_FLOOD_RETRIES = 3
 ENTITY_CACHE_LIMIT = 256
+SUPER_DUPLICATE_SCAN_INTERVAL = 20
+SUPER_DUPLICATE_BATCH_SIZE = 8
+SUPER_DUPLICATE_MIN_SCORE = 88.0
 
 
 class MediaRuntime:
@@ -70,6 +73,7 @@ class MediaRuntime:
         self.entity_cache: dict[int, object] = {}
         self.self_uploaded_database_ids: set[int] = set()
         self.reverse_index_task: asyncio.Task | None = None
+        self.super_duplicate_task: asyncio.Task | None = None
 
     # Reverse-search fingerprint format/version.
     REVERSE_FP_VERSION = 4
@@ -292,6 +296,14 @@ class MediaRuntime:
     async def start_reverse_index_build(self) -> bool:
         if not self.running or not self.client:
             return False
+        if self.super_duplicate_task and not self.super_duplicate_task.done():
+            self.super_duplicate_task.cancel()
+            await asyncio.gather(
+                self.super_duplicate_task,
+                return_exceptions=True,
+            )
+        self.super_duplicate_task = None
+
         if self.reverse_index_task and not self.reverse_index_task.done():
             return True
         self.reverse_index_task = asyncio.create_task(
@@ -429,6 +441,208 @@ class MediaRuntime:
         # final reliability threshold and never exposes a list of guesses.
         return results[:1]
 
+    async def _super_duplicate_score(
+        self,
+        query_hashes: list[str],
+        stored_hashes: list[str],
+    ) -> tuple[float, int]:
+        """Score independent visual evidence for the second-pass detector."""
+        evidence: list[float] = []
+        for qh in query_hashes:
+            best = max(
+                (self._hash_similarity(qh, sh) for sh in stored_hashes),
+                default=0.0,
+            )
+            if best >= 62:
+                evidence.append(best)
+        if not evidence:
+            return 0.0, 0
+        evidence.sort(reverse=True)
+        # Several independent regions/fingerprint families must agree.
+        top = evidence[:12]
+        strong = sum(1 for value in evidence if value >= 82)
+        very_strong = sum(1 for value in evidence if value >= 90)
+        score = sum(top) / len(top)
+        if strong >= 3:
+            score = max(score, min(99.9, evidence[0] + min(7.0, strong * 1.4)))
+        if very_strong >= 2:
+            score = max(score, min(99.9, evidence[0] + 5.0))
+        return score, strong
+
+    async def _super_duplicate_scan_record(self, record: dict) -> None:
+        """Verify one Database record against the whole visual index."""
+        if not self.client or not self.client.is_connected():
+            return
+        media_id = int(record.get("id") or record.get("_id") or 0)
+        chat_id = int(record.get("database_chat_id") or 0)
+        message_id = int(record.get("database_message_id") or 0)
+        kind = str(record.get("media_kind") or "")
+        if not media_id or not chat_id or not message_id or kind not in {"video", "photo"}:
+            return
+
+        temp = self.temp_dir / f"super_duplicate_{uuid4().hex}"
+        try:
+            message = await asyncio.wait_for(
+                self.client.get_messages(chat_id, ids=message_id), 20
+            )
+            if not message or not getattr(message, "media", None):
+                await self.db.mark_super_duplicate_checked(media_id)
+                return
+            downloaded = await asyncio.wait_for(
+                message.download_media(file=str(temp)), 120
+            )
+            if not downloaded:
+                return
+            local = Path(downloaded)
+            query_hashes = await asyncio.wait_for(
+                self._fingerprint_local_media(local, kind), 60
+            )
+            if not query_hashes:
+                return
+
+            # Keep the reverse index current. This also makes the detector
+            # useful immediately after a new Database upload.
+            await self.db.upsert_reverse_media_fingerprint(
+                media_id=media_id,
+                media_kind=kind,
+                database_chat_id=chat_id,
+                database_message_id=message_id,
+                frame_hashes=query_hashes,
+            )
+
+            buckets = self.db.fingerprint_buckets(query_hashes)
+            candidates = await self.db.find_super_duplicate_candidates(
+                media_id=media_id,
+                media_kind=kind,
+                buckets=buckets,
+                limit=600,
+            )
+
+            best: tuple[float, int, dict] | None = None
+            for candidate in candidates:
+                stored = [str(x) for x in candidate.get("frame_hashes", []) if x]
+                if not stored:
+                    continue
+                score, strong = await self._super_duplicate_score(query_hashes, stored)
+                if score < SUPER_DUPLICATE_MIN_SCORE or strong < 3:
+                    continue
+                candidate_media_id = int(candidate.get("media_id") or 0)
+                if not candidate_media_id or candidate_media_id == media_id:
+                    continue
+                if best is None or score > best[0]:
+                    best = (score, strong, candidate)
+
+            await self.db.mark_super_duplicate_checked(media_id)
+            if best is None:
+                return
+
+            score, strong, candidate = best
+            original_id = int(candidate.get("media_id") or 0)
+            # The oldest Database record is always the canonical original.
+            if original_id > media_id:
+                original_id, media_id = media_id, original_id
+                original_chat_id, original_message_id = chat_id, message_id
+                duplicate_chat_id = int(candidate.get("database_chat_id") or 0)
+                duplicate_message_id = int(candidate.get("database_message_id") or 0)
+            else:
+                original_chat_id = int(candidate.get("database_chat_id") or 0)
+                original_message_id = int(candidate.get("database_message_id") or 0)
+                duplicate_chat_id = chat_id
+                duplicate_message_id = message_id
+
+            created = await self.db.record_super_duplicate_pair(
+                original_media_id=original_id,
+                duplicate_media_id=int(media_id),
+                score=score,
+                strong_evidence=strong,
+                original_chat_id=original_chat_id,
+                original_message_id=original_message_id,
+                duplicate_chat_id=duplicate_chat_id,
+                duplicate_message_id=duplicate_message_id,
+            )
+            if not created:
+                return
+
+            settings = await self.db.get_settings()
+            original_link = await self._message_link(original_chat_id, original_message_id)
+            duplicate_link = await self._message_link(duplicate_chat_id, duplicate_message_id)
+
+            deleted = False
+            if settings.get("delete_duplicates"):
+                try:
+                    entity = await self.client.get_entity(duplicate_chat_id)
+                    await self.client.delete_messages(
+                        entity,
+                        [duplicate_message_id],
+                        revoke=True,
+                    )
+                    await self.db.cancel_media_queue(int(media_id))
+                    deleted = True
+                except Exception:
+                    log.exception(
+                        "Super duplicate delete failed: %s/%s",
+                        duplicate_chat_id,
+                        duplicate_message_id,
+                    )
+
+            if settings.get("duplicate_alerts"):
+                action = "Deleted" if deleted else "Detected"
+                try:
+                    await self.alert_bot.send_message(
+                        chat_id=self.owner_id,
+                        text=(
+                            "🛡️ <b>Super Duplicate Detected</b>\n\n"
+                            f"Original: <a href=\"{original_link}\">Database Media</a>\n"
+                            f"Duplicate: <a href=\"{duplicate_link}\">Database Media</a>\n\n"
+                            f"Match: <b>{score:.1f}%</b>\n"
+                            f"Evidence: <b>{strong}</b> independent matches\n"
+                            f"Action: <b>{action}</b>"
+                        ),
+                        parse_mode="HTML",
+                        disable_web_page_preview=True,
+                    )
+                except Exception:
+                    log.exception("Could not send super duplicate alert")
+        except Exception:
+            log.exception(
+                "Super duplicate scan failed: %s/%s",
+                chat_id,
+                message_id,
+            )
+        finally:
+            Path(temp).unlink(missing_ok=True)
+
+    async def _super_duplicate_loop(self) -> None:
+        """Continuously walk the complete Database media set."""
+        while self.running:
+            try:
+                rows = await self.db.next_super_duplicate_scan_rows(
+                    limit=SUPER_DUPLICATE_BATCH_SIZE
+                )
+                if not rows:
+                    await asyncio.sleep(SUPER_DUPLICATE_SCAN_INTERVAL)
+                    continue
+                for record in rows:
+                    if not self.running:
+                        break
+                    await self._super_duplicate_scan_record(record)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("Super duplicate detector cycle failed")
+            await asyncio.sleep(0.2)
+
+    async def start_super_duplicate_detector(self) -> bool:
+        if not self.running or not self.client:
+            return False
+        if self.super_duplicate_task and not self.super_duplicate_task.done():
+            return True
+        self.super_duplicate_task = asyncio.create_task(
+            self._super_duplicate_loop(),
+            name="super-database-duplicate-detector",
+        )
+        return True
+
     async def start(self) -> None:
         settings = await self.db.get_settings()
         if not settings["service_enabled"] or self.running:
@@ -490,6 +704,7 @@ class MediaRuntime:
         self.poll_task = asyncio.create_task(self._poll_loop())
         # Search indexing is automatic and silent; no owner-facing progress messages.
         await self.start_reverse_index_build()
+        await self.start_super_duplicate_detector()
 
         log.info(
             "Media polling runtime started | sources=%s database=%s",
