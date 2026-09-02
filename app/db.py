@@ -57,7 +57,6 @@ class Database:
         self.database_upload_tokens = self.database["database_upload_tokens"]
         self.runtime_locks = self.database["runtime_locks"]
         self.reverse_media_index = self.database["reverse_media_index"]
-        self.super_duplicate_pairs = self.database["super_duplicate_pairs"]
 
     async def initialize(self) -> None:
         await self.client.admin.command("ping")
@@ -89,18 +88,13 @@ class Database:
             [("media_kind", ASCENDING)],
             name="reverse_media_kind",
         )
-        await self.reverse_media_index.create_index(
-            [("fingerprint_buckets", ASCENDING)],
-            name="reverse_media_buckets",
+        await self.media.create_index(
+            [("super_checked_at", ASCENDING), ("id", ASCENDING)],
+            name="super_duplicate_scan_order",
         )
-        await self.super_duplicate_pairs.create_index(
-            [("original_media_id", ASCENDING), ("duplicate_media_id", ASCENDING)],
-            unique=True,
-            name="unique_super_duplicate_pair",
-        )
-        await self.super_duplicate_pairs.create_index(
-            [("duplicate_media_id", ASCENDING)],
-            name="super_duplicate_duplicate_media",
+        await self.media.create_index(
+            [("super_duplicate_of", ASCENDING)],
+            name="super_duplicate_of",
         )
 
     async def upsert_reverse_media_fingerprint(
@@ -111,6 +105,8 @@ class Database:
         database_chat_id: int,
         database_message_id: int,
         frame_hashes: list[str],
+        duration: float = 0.0,
+        dimensions: list[int] | None = None,
     ) -> None:
         await self.reverse_media_index.update_one(
             {
@@ -124,8 +120,9 @@ class Database:
                     "database_chat_id": int(database_chat_id),
                     "database_message_id": int(database_message_id),
                     "frame_hashes": list(frame_hashes),
-                    "fingerprint_buckets": self.fingerprint_buckets(frame_hashes),
-                    "fingerprint_version": 4,
+                    "duration": float(duration or 0.0),
+                    "dimensions": list(dimensions) if dimensions else None,
+                    "fingerprint_version": 5,
                     "updated_at": now(),
                 },
                 "$setOnInsert": {"created_at": now()},
@@ -133,125 +130,11 @@ class Database:
             upsert=True,
         )
 
-    @staticmethod
-    def fingerprint_buckets(frame_hashes: list[str]) -> list[str]:
-        """Build broad visual buckets for fast candidate retrieval.
-
-        Only a few leading bits are used, so the bucket is intentionally broad;
-        final duplicate decisions still use full Hamming-distance comparison.
-        """
-        buckets: set[str] = set()
-        for value in frame_hashes:
-            parts = str(value).split(":")
-            if len(parts) != 3:
-                continue
-            family, region, digest = parts
-            digest = digest.lower()
-            if len(digest) < 2:
-                continue
-            # 8-bit bucket plus family/region keeps the candidate set bounded
-            # while allowing moderate recompression/crop changes.
-            buckets.add(f"{family}:{region}:{digest[:2]}")
-            # A family-only coarse bucket protects against region-label changes
-            # when screenshots contain Telegram UI around the actual media.
-            buckets.add(f"{family}:*:{digest[:1]}")
-        return sorted(buckets)
-
-    async def find_super_duplicate_candidates(
-        self,
-        *,
-        media_id: int,
-        media_kind: str,
-        buckets: list[str],
-        limit: int = 600,
-    ) -> list[dict]:
-        if not buckets:
-            return []
-        cursor = self.reverse_media_index.find(
-            {
-                "media_kind": str(media_kind),
-                "media_id": {"$ne": int(media_id)},
-                "fingerprint_buckets": {"$in": list(buckets)},
-                "fingerprint_version": 4,
-            },
-            {
-                "_id": 0,
-                "media_id": 1,
-                "media_kind": 1,
-                "database_chat_id": 1,
-                "database_message_id": 1,
-                "frame_hashes": 1,
-            },
-        ).limit(int(limit))
-        return [dict(row) async for row in cursor]
-
-    async def mark_super_duplicate_checked(self, media_id: int) -> None:
-        await self.media.update_one(
-            {"_id": int(media_id)},
-            {"$set": {"super_duplicate_checked_at": now()}},
-        )
-
-    async def next_super_duplicate_scan_rows(self, limit: int = 8) -> list[dict]:
-        cursor = self.media.find(
-            {"media_kind": {"$in": ["video", "photo"]}},
-        ).sort(
-            [
-                ("super_duplicate_checked_at", ASCENDING),
-                ("id", ASCENDING),
-            ]
-        ).limit(int(limit))
-        return [dict(row) async for row in cursor]
-
-    async def record_super_duplicate_pair(
-        self,
-        *,
-        original_media_id: int,
-        duplicate_media_id: int,
-        score: float,
-        strong_evidence: int,
-        original_chat_id: int,
-        original_message_id: int,
-        duplicate_chat_id: int,
-        duplicate_message_id: int,
-    ) -> bool:
-        try:
-            await self.super_duplicate_pairs.insert_one(
-                {
-                    "original_media_id": int(original_media_id),
-                    "duplicate_media_id": int(duplicate_media_id),
-                    "score": float(score),
-                    "strong_evidence": int(strong_evidence),
-                    "original_chat_id": int(original_chat_id),
-                    "original_message_id": int(original_message_id),
-                    "duplicate_chat_id": int(duplicate_chat_id),
-                    "duplicate_message_id": int(duplicate_message_id),
-                    "created_at": now(),
-                }
-            )
-            return True
-        except DuplicateKeyError:
-            return False
-
-    async def cancel_media_queue(self, media_id: int) -> None:
-        await self.publish_queue.update_many(
-            {
-                "media_id": int(media_id),
-                "status": "pending",
-            },
-            {
-                "$set": {
-                    "status": "cancelled",
-                    "last_error": "Cancelled by Super Duplicate Detector",
-                    "failed_at": now(),
-                }
-            },
-        )
-
     async def reverse_index_counts(self) -> dict:
         total_media = await self.media.count_documents(
             {"media_kind": {"$in": ["video", "photo"]}}
         )
-        indexed = await self.reverse_media_index.count_documents({"fingerprint_version": 4})
+        indexed = await self.reverse_media_index.count_documents({"fingerprint_version": 5})
         return {"total": int(total_media), "indexed": int(indexed)}
 
     async def unindexed_reverse_media(
@@ -275,7 +158,7 @@ class Database:
                 {
                     "database_chat_id": int(media.get("database_chat_id") or 0),
                     "database_message_id": int(media.get("database_message_id") or 0),
-                    "fingerprint_version": 4,
+                    "fingerprint_version": 5,
                 },
                 {"_id": 1},
             )
@@ -288,6 +171,59 @@ class Database:
 
     async def all_reverse_fingerprints(self) -> list[dict]:
         return [dict(row) async for row in self.reverse_media_index.find({})]
+
+    async def next_super_duplicate_media(self) -> dict | None:
+        """Return the next Database media for continuous second-pass checking.
+
+        Missing/old checks are preferred, then the oldest checked item. This
+        makes the detector eventually cover the complete Database and then
+        keep cycling forever without downloading the whole library at once.
+        """
+        row = await self.media.find_one(
+            {
+                "media_kind": {"$in": ["video", "photo"]},
+                "$or": [
+                    {"super_checked_at": {"$exists": False}},
+                    {"super_checked_at": None},
+                ],
+            },
+            sort=[("id", ASCENDING)],
+        )
+        if row:
+            return dict(row)
+        row = await self.media.find_one(
+            {"media_kind": {"$in": ["video", "photo"]}},
+            sort=[("super_checked_at", ASCENDING), ("id", ASCENDING)],
+        )
+        return dict(row) if row else None
+
+    async def mark_super_checked(
+        self,
+        media_id: int,
+        *,
+        duplicate_of: int | None = None,
+        score: float | None = None,
+    ) -> None:
+        values: dict[str, Any] = {
+            "super_checked_at": now(),
+        }
+        if duplicate_of is not None:
+            values["super_duplicate_of"] = int(duplicate_of)
+            values["super_duplicate_score"] = float(score or 0)
+            values["super_duplicate_detected_at"] = now()
+        else:
+            values["super_duplicate_of"] = None
+            values["super_duplicate_score"] = None
+        await self.media.update_one(
+            {"_id": int(media_id)},
+            {"$set": values},
+        )
+
+    async def cancel_media_queue(self, media_id: int, reason: str) -> None:
+        await self.publish_queue.update_many(
+            {"media_id": int(media_id), "status": "pending"},
+            {"$set": {"status": "cancelled", "last_error": str(reason)[:1000]}},
+        )
 
     async def close(self) -> None:
         await self.client.close()
