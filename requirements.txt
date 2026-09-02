@@ -6,4 +6,4 @@ cryptography==45.0.7
 pymongo==4.13.2
 Pillow>=10.0,<12
 
-numpy>=2.0,<3
+numpy==2.3.5
