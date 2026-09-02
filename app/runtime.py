@@ -41,6 +41,8 @@ DATABASE_UPLOAD_TOKEN_ONE = "\u200c"
 DATABASE_UPLOAD_TOKEN_BITS = 128
 UPLOAD_FLOOD_RETRIES = 3
 ENTITY_CACHE_LIMIT = 256
+SUPER_DUPLICATE_IDLE_DELAY_SECONDS = 8
+SUPER_DUPLICATE_BATCH_SIZE = 1
 
 
 class MediaRuntime:
@@ -332,6 +334,20 @@ class MediaRuntime:
     ) -> None:
         if kind not in {"video", "photo"}:
             return
+
+        # Never let visual indexing compete with the normal media pipeline.
+        # During an active source/database/destination operation we defer this
+        # expensive work to the background detector. This keeps the bot's
+        # original throughput and responsiveness unchanged.
+        if self.processing_lock.locked() and run_duplicate_check:
+            log.debug(
+                "Deferring visual duplicate indexing while normal media "
+                "processing is active: %s/%s",
+                database_chat_id,
+                database_message_id,
+            )
+            return
+
         try:
             hashes = await self._fingerprint_local_media(path, kind)
             if not hashes:
@@ -371,6 +387,10 @@ class MediaRuntime:
         score margin over the runner-up, so one coincidental frame cannot
         delete a genuine different clip.
         """
+        # The visual detector must never hold up the normal media pipeline.
+        if self.processing_lock.locked():
+            return False
+
         candidates = await self.db.all_reverse_fingerprints()
         current_chat = int(record.get("database_chat_id") or 0)
         current_message = int(record.get("database_message_id") or 0)
@@ -420,8 +440,14 @@ class MediaRuntime:
                     return None
             return float(score)
 
-        for candidate in candidates:
+        for candidate_index, candidate in enumerate(candidates):
+            if self.processing_lock.locked():
+                return False
             score = await asyncio.to_thread(compare, candidate)
+            # Explicitly yield between candidates so Telegram polling and
+            # publishing are never starved by a large Database index.
+            if candidate_index % 8 == 0:
+                await asyncio.sleep(0)
             if score is None:
                 continue
             item = (score, candidate)
@@ -474,6 +500,11 @@ class MediaRuntime:
 
         original_link = await self._message_link(original_chat, original_message)
         duplicate_link = await self._message_link(duplicate_chat, duplicate_message)
+        # Re-check immediately before any destructive action. If normal media
+        # processing started while we were comparing, defer the duplicate.
+        if self.processing_lock.locked():
+            return False
+
         settings = await self.db.get_settings()
         if settings.get("delete_duplicates") and duplicate_record_id:
             try:
@@ -562,26 +593,43 @@ class MediaRuntime:
         return processed
 
     async def _super_duplicate_background_loop(self) -> None:
-        """Keep Database visual duplicate detection alive in the background."""
+        """Run visual duplicate detection only when the normal bot is idle.
+
+        This worker is deliberately low priority: normal source/database/
+        destination processing always wins. A single media is handled per
+        pass and the event loop gets frequent opportunities to run Telegram
+        polling and publishing.
+        """
         try:
             while self.running:
                 try:
-                    if not (self.reverse_index_task and not self.reverse_index_task.done()):
-                        await self.start_reverse_index_build()
-                    # Do not compete with the full Mongo-media rebuild. Once
-                    # it is idle, walk the real Telegram Database history to
-                    # catch messages that never became media records.
-                    if not (self.reverse_index_task and not self.reverse_index_task.done()):
-                        settings = await self.db.get_settings()
-                        if settings.get("database_chat_active") and settings.get("database_chat_id"):
-                            await self._scan_database_history_super_duplicates(
-                                int(settings["database_chat_id"]), limit=100
-                            )
+                    if self.processing_lock.locked():
+                        await asyncio.sleep(SUPER_DUPLICATE_IDLE_DELAY_SECONDS)
+                        continue
+
+                    task = self.reverse_index_task
+                    if task and not task.done():
+                        await asyncio.sleep(2)
+                        continue
+
+                    await self.start_reverse_index_build()
+                    # Give the main Telegram pipeline priority before the next
+                    # visual operation. Do not scan history in the same pass.
+                    await asyncio.sleep(SUPER_DUPLICATE_IDLE_DELAY_SECONDS)
+
+                    if self.processing_lock.locked():
+                        continue
+
+                    settings = await self.db.get_settings()
+                    if settings.get("database_chat_active") and settings.get("database_chat_id"):
+                        await self._scan_database_history_super_duplicates(
+                            int(settings["database_chat_id"]), limit=1
+                        )
                 except asyncio.CancelledError:
                     raise
                 except Exception:
                     log.exception("Super duplicate background loop failed")
-                await asyncio.sleep(30)
+                await asyncio.sleep(SUPER_DUPLICATE_IDLE_DELAY_SECONDS)
         except asyncio.CancelledError:
             raise
 
@@ -605,13 +653,16 @@ class MediaRuntime:
             # Run until all unindexed media are handled. A failed Telegram
             # download must be excluded for this pass, otherwise one broken
             # message can make the worker loop over the same record forever.
-            while True:
-                rows = await self.db.unindexed_reverse_media(
-                    limit=20, exclude_media_ids=excluded_media_ids
-                )
-                if not rows:
-                    break
-                for record in rows:
+            # One media per pass. The normal bot always has priority.
+            rows = await self.db.unindexed_reverse_media(
+                limit=SUPER_DUPLICATE_BATCH_SIZE,
+                exclude_media_ids=excluded_media_ids,
+            )
+            if not rows:
+                return
+            for record in rows:
+                if self.processing_lock.locked():
+                    return
                     chat_id = int(record.get("database_chat_id") or 0)
                     message_id = int(record.get("database_message_id") or 0)
                     kind = str(record.get("media_kind") or "")
