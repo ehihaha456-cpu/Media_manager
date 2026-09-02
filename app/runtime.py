@@ -9,6 +9,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from PIL import Image
+import numpy as np
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from telegram import Bot
@@ -33,10 +34,6 @@ HISTORY_PAGE_SIZE = 100
 HISTORY_MEDIA_BATCH_SIZE = 10
 HISTORY_PROGRESS_EVERY = 100
 DATABASE_SELF_UPLOAD_GRACE_SECONDS = 15
-SUPER_DUPLICATE_IDLE_SECONDS = 2
-SUPER_DUPLICATE_STRONG = 88.0
-SUPER_DUPLICATE_ACCEPT = 84.0
-SUPER_DUPLICATE_MARGIN = 6.0
 DATABASE_SELF_UPLOAD_MARKER = "\u2063"
 DATABASE_UPLOAD_TOKEN_PREFIX = "\u2063\u2063"
 DATABASE_UPLOAD_TOKEN_SUFFIX = "\u2063\u2063"
@@ -74,11 +71,9 @@ class MediaRuntime:
         self.entity_cache: dict[int, object] = {}
         self.self_uploaded_database_ids: set[int] = set()
         self.reverse_index_task: asyncio.Task | None = None
-        self.super_duplicate_task: asyncio.Task | None = None
-        self.super_duplicate_alerted: set[tuple[int, int]] = set()
 
     # Reverse-search fingerprint format/version.
-    REVERSE_FP_VERSION = 5
+    REVERSE_FP_VERSION = 4
 
     @staticmethod
     def _image_hashes(image: Image.Image) -> list[str]:
@@ -90,8 +85,6 @@ class MediaRuntime:
         small grid of central regions.  This is intentionally independent of
         filename, Telegram message id, compression and resolution.
         """
-        import numpy as np
-
         image = image.convert("RGB")
         w, h = image.size
         if w < 16 or h < 16:
@@ -183,112 +176,12 @@ class MediaRuntime:
         try:
             lp = left.split(":")
             rp = right.split(":")
-            if len(lp) < 3 or len(rp) < 3 or lp[0] != rp[0]:
+            if len(lp) != 3 or len(rp) != 3 or lp[:2] != rp[:2]:
                 return 0.0
-            # The optional middle components identify video frame/region.
-            # For visual matching we intentionally allow cross-region matches
-            # because screenshots can contain Telegram UI, borders or crops.
-            lh = int(lp[-1], 16)
-            rh = int(rp[-1], 16)
-            width = max(lh.bit_length(), rh.bit_length(), 64)
-            distance = (lh ^ rh).bit_count()
-            return max(0.0, 100.0 * (width - distance) / width)
+            distance = (int(lp[2], 16) ^ int(rp[2], 16)).bit_count()
         except Exception:
             return 0.0
-
-    @staticmethod
-    def _hash_family(value: str) -> str:
-        return str(value).split(":", 1)[0]
-
-    @staticmethod
-    def _hash_frame(value: str) -> str | None:
-        parts = str(value).split(":")
-        for part in parts[1:-1]:
-            if part.startswith("v") and part[1:].isdigit():
-                return part
-        return None
-
-    def _super_duplicate_score(
-        self,
-        query_hashes: list[str],
-        stored_hashes: list[str],
-        kind: str,
-    ) -> float:
-        if not query_hashes or not stored_hashes:
-            return 0.0
-
-        # Compare each perceptual family independently. This prevents one
-        # noisy hash family from dominating the decision.
-        by_family: dict[str, list[str]] = defaultdict(list)
-        for item in stored_hashes:
-            by_family[self._hash_family(item)].append(item)
-
-        family_scores: dict[str, list[float]] = defaultdict(list)
-        for query in query_hashes:
-            family = self._hash_family(query)
-            pool = by_family.get(family, [])
-            if not pool:
-                continue
-            best = max((self._hash_similarity(query, item) for item in pool), default=0.0)
-            if best >= 60:
-                family_scores[family].append(best)
-
-        if not family_scores:
-            return 0.0
-
-        family_values = []
-        weights = {"p": 0.45, "d": 0.35, "a": 0.20}
-        for family, values in family_scores.items():
-            values.sort(reverse=True)
-            # Multiple independent regions must agree.
-            family_values.append((
-                family,
-                sum(values[:6]) / max(1, len(values[:6])),
-                sum(1 for value in values if value >= SUPER_DUPLICATE_STRONG),
-            ))
-
-        weighted = 0.0
-        weight_total = 0.0
-        strong_total = 0
-        for family, score, strong in family_values:
-            weight = weights.get(family, 0.10)
-            weighted += score * weight
-            weight_total += weight
-            strong_total += strong
-        score = weighted / max(weight_total, 0.01)
-
-        # Videos must agree on several sampled frames. A single coincidental
-        # frame is never enough to declare two clips duplicates.
-        if kind == "video":
-            q_frames = {self._hash_frame(x) for x in query_hashes if self._hash_frame(x)}
-            s_frames = {self._hash_frame(x) for x in stored_hashes if self._hash_frame(x)}
-            if q_frames and s_frames:
-                matched_frames = 0
-                frame_scores = []
-                for qf in q_frames:
-                    q_items = [x for x in query_hashes if self._hash_frame(x) == qf]
-                    best_frame = 0.0
-                    for sf in s_frames:
-                        s_items = [x for x in stored_hashes if self._hash_frame(x) == sf]
-                        local = []
-                        for q_item in q_items:
-                            local.append(max((self._hash_similarity(q_item, s_item) for s_item in s_items), default=0.0))
-                        local.sort(reverse=True)
-                        frame_score = sum(local[:3]) / max(1, len(local[:3]))
-                        best_frame = max(best_frame, frame_score)
-                    frame_scores.append(best_frame)
-                frame_scores.sort(reverse=True)
-                matched_frames = sum(1 for value in frame_scores if value >= SUPER_DUPLICATE_STRONG)
-                if matched_frames < 3:
-                    return 0.0
-                score = max(score, sum(frame_scores[:6]) / max(1, len(frame_scores[:6])))
-
-        # Require corroboration from multiple hash families.
-        families_present = sum(1 for family, values in family_scores.items() if any(v >= 78 for v in values))
-        if families_present < 2 or strong_total < 3:
-            return 0.0
-        return round(min(99.9, score), 2)
-
+        return max(0.0, 100.0 * (64 - distance) / 64)
 
     async def _video_duration(self, path: Path) -> float:
         try:
@@ -331,24 +224,14 @@ class MediaRuntime:
                 )
                 return []
             hashes = []
-            for frame_index, frame in enumerate(sorted(frame_dir.glob("frame_*.jpg"))):
+            for frame in sorted(frame_dir.glob("frame_*.jpg")):
                 try:
                     with Image.open(frame) as image:
-                        frame_hashes = await asyncio.to_thread(
-                            self._image_hashes,
-                            image.copy(),
-                        )
                         hashes.extend(
-                            [
-                                ":".join([
-                                    parts[0],
-                                    f"v{frame_index:02d}",
-                                    *parts[1:],
-                                ])
-                                for value in frame_hashes
-                                for parts in [value.split(":")]
-                                if len(parts) == 3
-                            ]
+                            await asyncio.to_thread(
+                                self._image_hashes,
+                                image.copy(),
+                            )
                         )
                 except Exception:
                     log.exception("Could not hash extracted frame: %s", frame)
@@ -391,22 +274,12 @@ class MediaRuntime:
             hashes = await self._fingerprint_local_media(path, kind)
             if not hashes:
                 return
-            duration = await self._video_duration(path) if kind == "video" else 0.0
-            dimensions = None
-            if kind == "photo":
-                try:
-                    with Image.open(path) as image:
-                        dimensions = [int(image.width), int(image.height)]
-                except Exception:
-                    dimensions = None
             await self.db.upsert_reverse_media_fingerprint(
                 media_id=int(record["id"]),
                 media_kind=kind,
                 database_chat_id=int(database_chat_id),
                 database_message_id=int(database_message_id),
                 frame_hashes=hashes,
-                duration=duration,
-                dimensions=dimensions,
             )
         except Exception:
             log.exception(
@@ -414,194 +287,6 @@ class MediaRuntime:
                 database_chat_id,
                 database_message_id,
             )
-
-    async def _download_database_record(self, record: dict, prefix: str = "super") -> tuple[Path, str] | None:
-        if not self.client:
-            return None
-        chat_id = int(record.get("database_chat_id") or 0)
-        message_id = int(record.get("database_message_id") or 0)
-        kind = str(record.get("media_kind") or "")
-        if not chat_id or not message_id or kind not in {"video", "photo"}:
-            return None
-        temp = self.temp_dir / f"{prefix}_{uuid4().hex}"
-        try:
-            message = await asyncio.wait_for(
-                self.client.get_messages(chat_id, ids=message_id), 20
-            )
-            if not message or not getattr(message, "media", None):
-                return None
-            downloaded = await asyncio.wait_for(
-                message.download_media(file=str(temp)), 120
-            )
-            if not downloaded:
-                return None
-            return Path(downloaded), kind
-        except Exception:
-            log.debug("Super duplicate download failed: %s/%s", chat_id, message_id, exc_info=True)
-            Path(temp).unlink(missing_ok=True)
-            return None
-
-    @staticmethod
-    def _metadata_similarity(current: dict, candidate: dict, kind: str) -> float:
-        if kind != "video":
-            return 0.0
-        left = float(current.get("super_duration") or 0.0)
-        right = float(candidate.get("duration") or 0.0)
-        if left <= 0 or right <= 0:
-            return 0.0
-        ratio = abs(left - right) / max(left, right)
-        if ratio <= 0.02:
-            return 100.0
-        if ratio <= 0.05:
-            return 90.0
-        if ratio <= 0.10:
-            return 70.0
-        return 0.0
-
-    async def _super_find_duplicate(
-        self,
-        record: dict,
-        query_hashes: list[str],
-    ) -> tuple[dict | None, float]:
-        kind = str(record.get("media_kind") or "")
-        current_id = int(record.get("id") or record.get("_id") or 0)
-        candidates = await self.db.all_reverse_fingerprints()
-        ranked: list[tuple[float, dict]] = []
-        for candidate in candidates:
-            if int(candidate.get("media_id") or 0) == current_id:
-                continue
-            if str(candidate.get("media_kind") or "") != kind:
-                continue
-            stored = [str(x) for x in candidate.get("frame_hashes", []) if x]
-            score = self._super_duplicate_score(query_hashes, stored, kind)
-            if score > 0:
-                meta = self._metadata_similarity(record, candidate, kind)
-                if meta >= 90:
-                    score = min(99.9, score * 0.92 + meta * 0.08)
-                elif kind == "video" and meta == 0:
-                    # A large duration mismatch is strong evidence that two
-                    # clips merely share a scene; demand a higher visual score.
-                    if score < 92.0:
-                        score = 0.0
-            if score >= SUPER_DUPLICATE_ACCEPT:
-                ranked.append((score, candidate))
-        ranked.sort(key=lambda item: item[0], reverse=True)
-        if not ranked:
-            return None, 0.0
-        best_score, best = ranked[0]
-        runner_up = ranked[1][0] if len(ranked) > 1 else 0.0
-        if runner_up and best_score - runner_up < SUPER_DUPLICATE_MARGIN:
-            return None, best_score
-        return best, best_score
-
-    async def _handle_super_duplicate(
-        self,
-        record: dict,
-        duplicate: dict,
-        score: float,
-    ) -> None:
-        current_id = int(record.get("id") or record.get("_id") or 0)
-        original_id = int(duplicate.get("media_id") or 0)
-        if not current_id or not original_id:
-            return
-        await self.db.mark_super_checked(
-            current_id,
-            duplicate_of=original_id,
-            score=score,
-        )
-        await self.db.cancel_media_queue(
-            current_id,
-            f"Super duplicate detected; original media_id={original_id}; score={score:.1f}",
-        )
-
-        settings = await self.db.get_settings()
-        chat_id = int(record.get("database_chat_id") or 0)
-        message_id = int(record.get("database_message_id") or 0)
-        original_chat = int(duplicate.get("database_chat_id") or 0)
-        original_message = int(duplicate.get("database_message_id") or 0)
-        key = (chat_id, message_id)
-
-        if settings.get("delete_duplicates"):
-            try:
-                entity = await self._resolve_peer(chat_id)
-                await self.client.delete_messages(entity, [message_id], revoke=True)
-            except Exception:
-                log.exception("Super duplicate Database message could not be deleted: %s/%s", chat_id, message_id)
-
-        if settings.get("duplicate_alerts") and key not in self.super_duplicate_alerted:
-            self.super_duplicate_alerted.add(key)
-            try:
-                original_link = await self._message_link(original_chat, original_message)
-                duplicate_link = await self._message_link(chat_id, message_id)
-                await self.alert_bot.send_message(
-                    chat_id=self.owner_id,
-                    text=(
-                        "🛡 <b>Super Duplicate Detected</b>\n\n"
-                        f"Score: <b>{score:.1f}%</b>\n\n"
-                        f'<a href="{original_link}">📂 Original Media</a>    '
-                        f'<a href="{duplicate_link}">🆕 Duplicate Media</a>'
-                    ),
-                    parse_mode="HTML",
-                    disable_web_page_preview=True,
-                )
-            except Exception:
-                log.exception("Could not send Super Duplicate alert")
-
-    async def _super_duplicate_cycle(self) -> None:
-        """Continuously re-check the entire Database in a bounded loop."""
-        while self.running and self.client and self.client.is_connected():
-            try:
-                record = await self.db.next_super_duplicate_media()
-                if not record:
-                    await asyncio.sleep(10)
-                    continue
-                downloaded = await self._download_database_record(record)
-                if not downloaded:
-                    await self.db.mark_super_checked(int(record["id"]))
-                    await asyncio.sleep(SUPER_DUPLICATE_IDLE_SECONDS)
-                    continue
-                path, kind = downloaded
-                try:
-                    query_hashes = await self._fingerprint_local_media(path, kind)
-                    if not query_hashes:
-                        await self.db.mark_super_checked(int(record["id"]))
-                        continue
-
-                    # Always keep the current record in the reverse index so
-                    # later media can be compared against it immediately.
-                    duration = await self._video_duration(path) if kind == "video" else 0.0
-                    dimensions = None
-                    if kind == "photo":
-                        try:
-                            with Image.open(path) as image:
-                                dimensions = [int(image.width), int(image.height)]
-                        except Exception:
-                            dimensions = None
-                    await self.db.upsert_reverse_media_fingerprint(
-                        media_id=int(record["id"]),
-                        media_kind=kind,
-                        database_chat_id=int(record["database_chat_id"]),
-                        database_message_id=int(record["database_message_id"]),
-                        frame_hashes=query_hashes,
-                        duration=duration,
-                        dimensions=dimensions,
-                    )
-                    if kind == "video":
-                        record = dict(record)
-                        record["super_duration"] = await self._video_duration(path)
-                    duplicate, score = await self._super_find_duplicate(record, query_hashes)
-                    if duplicate:
-                        await self._handle_super_duplicate(record, duplicate, score)
-                    else:
-                        await self.db.mark_super_checked(int(record["id"]))
-                finally:
-                    path.unlink(missing_ok=True)
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                log.exception("Super duplicate detector cycle failed")
-                await asyncio.sleep(5)
-            await asyncio.sleep(SUPER_DUPLICATE_IDLE_SECONDS)
 
     async def start_reverse_index_build(self) -> bool:
         if not self.running or not self.client:
@@ -804,11 +489,6 @@ class MediaRuntime:
         self.poll_task = asyncio.create_task(self._poll_loop())
         # Search indexing is automatic and silent; no owner-facing progress messages.
         await self.start_reverse_index_build()
-        if not self.super_duplicate_task or self.super_duplicate_task.done():
-            self.super_duplicate_task = asyncio.create_task(
-                self._super_duplicate_cycle(),
-                name="super-duplicate-detector",
-            )
 
         log.info(
             "Media polling runtime started | sources=%s database=%s",
@@ -835,14 +515,6 @@ class MediaRuntime:
                 return_exceptions=True,
             )
         self.reverse_index_task = None
-
-        if self.super_duplicate_task and not self.super_duplicate_task.done():
-            self.super_duplicate_task.cancel()
-            await asyncio.gather(
-                self.super_duplicate_task,
-                return_exceptions=True,
-            )
-        self.super_duplicate_task = None
 
         for task in self.source_history_tasks.values():
             task.cancel()
