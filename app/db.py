@@ -57,6 +57,7 @@ class Database:
         self.database_upload_tokens = self.database["database_upload_tokens"]
         self.runtime_locks = self.database["runtime_locks"]
         self.reverse_media_index = self.database["reverse_media_index"]
+        self.super_duplicate_scan_state = self.database["super_duplicate_scan_state"]
 
     async def initialize(self) -> None:
         await self.client.admin.command("ping")
@@ -88,25 +89,12 @@ class Database:
             [("media_kind", ASCENDING)],
             name="reverse_media_kind",
         )
-        await self.media.create_index(
-            [("super_checked_at", ASCENDING), ("id", ASCENDING)],
-            name="super_duplicate_scan_order",
-        )
-        await self.media.create_index(
-            [("super_duplicate_of", ASCENDING)],
-            name="super_duplicate_of",
-        )
 
     async def upsert_reverse_media_fingerprint(
-        self,
-        *,
-        media_id: int,
-        media_kind: str,
-        database_chat_id: int,
-        database_message_id: int,
-        frame_hashes: list[str],
-        duration: float = 0.0,
-        dimensions: list[int] | None = None,
+        self, *, media_id: int, media_kind: str, database_chat_id: int,
+        database_message_id: int, frame_hashes: list[str],
+        super_frames: list[dict] | None = None, duration_seconds: float = 0.0,
+        width: int = 0, height: int = 0,
     ) -> None:
         await self.reverse_media_index.update_one(
             {
@@ -120,8 +108,10 @@ class Database:
                     "database_chat_id": int(database_chat_id),
                     "database_message_id": int(database_message_id),
                     "frame_hashes": list(frame_hashes),
-                    "duration": float(duration or 0.0),
-                    "dimensions": list(dimensions) if dimensions else None,
+                    "super_frames": list(super_frames or []),
+                    "duration_seconds": float(duration_seconds or 0.0),
+                    "width": int(width or 0),
+                    "height": int(height or 0),
                     "fingerprint_version": 5,
                     "updated_at": now(),
                 },
@@ -170,59 +160,65 @@ class Database:
         return rows
 
     async def all_reverse_fingerprints(self) -> list[dict]:
-        return [dict(row) async for row in self.reverse_media_index.find({})]
+        return [dict(row) async for row in self.reverse_media_index.find({"fingerprint_version": 5})]
 
-    async def next_super_duplicate_media(self) -> dict | None:
-        """Return the next Database media for continuous second-pass checking.
+    async def claim_super_duplicate_pair(
+        self, pair_key: str, original_chat_id: int, original_message_id: int,
+        duplicate_chat_id: int, duplicate_message_id: int, score: float,
+    ) -> bool:
+        collection = self.database["super_duplicate_pairs"]
+        try:
+            await collection.insert_one({
+                "_id": str(pair_key),
+                "original_chat_id": int(original_chat_id),
+                "original_message_id": int(original_message_id),
+                "duplicate_chat_id": int(duplicate_chat_id),
+                "duplicate_message_id": int(duplicate_message_id),
+                "score": float(score),
+                "created_at": now(),
+            })
+            return True
+        except DuplicateKeyError:
+            return False
 
-        Missing/old checks are preferred, then the oldest checked item. This
-        makes the detector eventually cover the complete Database and then
-        keep cycling forever without downloading the whole library at once.
-        """
-        row = await self.media.find_one(
-            {
-                "media_kind": {"$in": ["video", "photo"]},
-                "$or": [
-                    {"super_checked_at": {"$exists": False}},
-                    {"super_checked_at": None},
-                ],
-            },
-            sort=[("id", ASCENDING)],
-        )
-        if row:
-            return dict(row)
-        row = await self.media.find_one(
-            {"media_kind": {"$in": ["video", "photo"]}},
-            sort=[("super_checked_at", ASCENDING), ("id", ASCENDING)],
-        )
-        return dict(row) if row else None
-
-    async def mark_super_checked(
-        self,
-        media_id: int,
-        *,
-        duplicate_of: int | None = None,
-        score: float | None = None,
-    ) -> None:
-        values: dict[str, Any] = {
-            "super_checked_at": now(),
-        }
-        if duplicate_of is not None:
-            values["super_duplicate_of"] = int(duplicate_of)
-            values["super_duplicate_score"] = float(score or 0)
-            values["super_duplicate_detected_at"] = now()
-        else:
-            values["super_duplicate_of"] = None
-            values["super_duplicate_score"] = None
-        await self.media.update_one(
-            {"_id": int(media_id)},
-            {"$set": values},
-        )
-
-    async def cancel_media_queue(self, media_id: int, reason: str) -> None:
+    async def cancel_media_queues(self, media_id: int) -> None:
         await self.publish_queue.update_many(
             {"media_id": int(media_id), "status": "pending"},
-            {"$set": {"status": "cancelled", "last_error": str(reason)[:1000]}},
+            {"$set": {"status": "cancelled", "last_error": "Super duplicate detected", "failed_at": now()}},
+        )
+
+    async def delete_reverse_media_fingerprint(
+        self, database_chat_id: int, database_message_id: int,
+    ) -> None:
+        await self.reverse_media_index.delete_one({
+            "database_chat_id": int(database_chat_id),
+            "database_message_id": int(database_message_id),
+        })
+
+    async def reverse_index_has(
+        self, database_chat_id: int, database_message_id: int,
+    ) -> bool:
+        document = await self.reverse_media_index.find_one(
+            {
+                "database_chat_id": int(database_chat_id),
+                "database_message_id": int(database_message_id),
+                "fingerprint_version": 5,
+            },
+            {"_id": 1},
+        )
+        return bool(document)
+
+    async def get_super_duplicate_scan_cursor(self, chat_id: int) -> int:
+        document = await self.super_duplicate_scan_state.find_one(
+            {"_id": str(int(chat_id))}, {"cursor": 1}
+        )
+        return int(document.get("cursor") or 0) if document else 0
+
+    async def set_super_duplicate_scan_cursor(self, chat_id: int, cursor: int) -> None:
+        await self.super_duplicate_scan_state.update_one(
+            {"_id": str(int(chat_id))},
+            {"$set": {"cursor": int(cursor), "updated_at": now()}},
+            upsert=True,
         )
 
     async def close(self) -> None:
@@ -678,6 +674,10 @@ class Database:
         media_id: int,
         destination_chat_id: int,
     ) -> None:
+        # Never create a queue entry for a media record that a duplicate
+        # detector has already removed.
+        if not await self.media.find_one({"_id": int(media_id)}, {"_id": 1}):
+            return
         existing = await self.publish_queue.find_one(
             {
                 "media_id": int(media_id),
